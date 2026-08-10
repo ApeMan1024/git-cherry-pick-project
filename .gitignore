@@ -1,0 +1,8 @@
+gitCommitRecord
+document
+.**/
+!/.gitignore
+!/.gitattributes
+!/.editorconfig
+!/.env.example
+!**/.git/
