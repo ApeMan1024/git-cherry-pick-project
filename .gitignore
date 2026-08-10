@@ -1,5 +1,8 @@
 gitCommitRecord
 document
+commitTextSearch
+warehouse.json
+gitCommitText.json
 .**/
 !/.gitignore
 !/.gitattributes

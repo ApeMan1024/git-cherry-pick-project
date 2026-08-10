@@ -1,15 +1,23 @@
 ﻿[CmdletBinding()]
 param(
-    [switch]$ScanOnly
+    [switch]$ScanOnly,
+    [string]$ProjectName = "",
+    [switch]$SkipPull
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = "Stop"
 
+# 让 PowerShell 以 UTF-8 解码 git 输出，解决提交记录中文乱码问题
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+}
+catch { }
+
 $ScriptRoot = $PSScriptRoot
 $WarehouseFile = Join-Path $ScriptRoot "warehouse.json"
 $DemandFile = Join-Path $ScriptRoot "gitCommitText.json"
-$RecordDirectory = Join-Path $ScriptRoot "gitCommitRecord"
 
 function Write-Step {
     param([string]$Message)
@@ -45,6 +53,24 @@ function Invoke-Git {
     }
 }
 
+function Read-TextFile {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    # 带 BOM 的 UTF-8
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        return [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+    }
+    # 无 BOM：优先按 UTF-8 严格解码，失败则退回系统默认编码（如 GBK）
+    try {
+        $utf8 = New-Object System.Text.UTF8Encoding($false, $true)
+        return $utf8.GetString($bytes)
+    }
+    catch {
+        return [System.Text.Encoding]::Default.GetString($bytes)
+    }
+}
+
 function Read-JsonFile {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
@@ -56,10 +82,10 @@ function Read-JsonFile {
     }
 
     try {
-        return (Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json)
+        return (Read-TextFile -Path $Path | ConvertFrom-Json)
     }
     catch {
-        throw "$Description不是有效 JSON：$Path`n注意：JSON 不支持注释、尾随逗号或未加双引号的属性名。`n$($_.Exception.Message)"
+        throw "$Description不是有效 JSON：$Path`n$($_.Exception.Message)"
     }
 }
 
@@ -68,7 +94,7 @@ function Resolve-ConfiguredPath {
 
     $value = $ConfiguredPath.Trim()
     if ([string]::IsNullOrWhiteSpace($value)) {
-        throw "warehouse.json 中存在空项目路径。"
+        throw "配置中存在空路径。"
     }
 
     if (-not [System.IO.Path]::IsPathRooted($value)) {
@@ -132,16 +158,18 @@ function Get-SourceCommits {
         [Parameter(Mandatory = $true)][string]$Branch
     )
 
+    # --encoding=UTF-8 保证 git 输出 UTF-8；%cI 输出 ISO-8601 提交时间。
     # 记录分隔符 0x1e、字段分隔符 0x1f，避免多行提交说明破坏解析。
     $log = Invoke-Git -RepoPath $RepoPath -Arguments @(
-        "log",
+        "--no-pager", "log",
         "--reverse",
-        "--format=%H%x1f%B%x1e",
+        "--encoding=UTF-8",
+        "--format=%H%x1f%cI%x1f%B%x1e",
         $Branch
     )
 
     $commits = New-Object System.Collections.ArrayList
-    $entries = $log.Output -split [string][char]0x1e
+    $entries = $log.Output -split ([string][char]0x1e)
     $order = 0
 
     foreach ($entry in $entries) {
@@ -149,19 +177,21 @@ function Get-SourceCommits {
             continue
         }
 
-        $parts = $entry -split [string][char]0x1f, 2
-        if ($parts.Count -ne 2) {
+        $parts = $entry -split ([string][char]0x1f), 3
+        if ($parts.Count -ne 3) {
             continue
         }
 
         $commitId = $parts[0].Trim()
-        $commitText = $parts[1].Trim()
+        $commitTime = $parts[1].Trim()
+        $commitText = $parts[2].Trim()
         if ([string]::IsNullOrWhiteSpace($commitId)) {
             continue
         }
 
         [void]$commits.Add([PSCustomObject]@{
             CommitId = $commitId
+            CommitTime = $commitTime
             CommitText = $commitText
             Order = $order
         })
@@ -180,13 +210,6 @@ function Get-SafeFileNamePart {
         throw "无法根据值生成安全文件名：$Value"
     }
     return $safeValue
-}
-
-function Get-RepositoryName {
-    param([Parameter(Mandatory = $true)][string]$RepoPath)
-
-    $trimmed = $RepoPath.TrimEnd([char[]]@('\', '/'))
-    return (Split-Path -Path $trimmed -Leaf)
 }
 
 function Test-CommitAlreadyApplied {
@@ -278,6 +301,48 @@ function Resolve-CherryPickFailure {
     }
 }
 
+function Select-Project {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Projects,
+        [Parameter(Mandatory = $true)][object[]]$ProjectKeys,
+        [string]$RequestedName = ""
+    )
+
+    # ProjectKeys 保持 warehouse.json 中的书写顺序，避免哈希表随机顺序导致选择错乱
+    $keys = @($ProjectKeys)
+    if ($keys.Count -eq 0) {
+        throw "warehouse.json 中没有配置任何项目。"
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedName)) {
+        $match = @($keys | Where-Object { $_ -ieq $RequestedName.Trim() })
+        if ($match.Count -eq 0) {
+            throw ("未找到项目 {0}。可用项目：{1}" -f $RequestedName, ($keys -join "、"))
+        }
+        return $match[0]
+    }
+
+    while ($true) {
+        Write-Host "`n可用项目："
+        for ($index = 0; $index -lt $keys.Count; $index++) {
+            Write-Host ("[{0}] {1}" -f ($index + 1), $keys[$index])
+        }
+        Write-Host "[Q] 退出"
+        $answer = (Read-Host "请选择要合并的项目序号").Trim()
+
+        if ($answer.ToUpperInvariant() -eq "Q") {
+            exit 0
+        }
+
+        $number = 0
+        if ([int]::TryParse($answer, [ref]$number) -and ($number -ge 1) -and ($number -le $keys.Count)) {
+            return $keys[$number - 1]
+        }
+
+        Write-Host "输入无效，请输入项目序号。" -ForegroundColor Yellow
+    }
+}
+
 function Select-Demands {
     param([Parameter(Mandatory = $true)][object[]]$DemandResults)
 
@@ -330,6 +395,28 @@ function Select-Demands {
     }
 }
 
+function Update-TargetBranch {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$BranchName
+    )
+
+    $upstream = Invoke-Git -RepoPath $RepoPath -Arguments @("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}") -AllowFailure
+    if ($upstream.ExitCode -ne 0) {
+        Write-Host "目标分支 $BranchName 没有配置上游分支（@{u}），跳过更新。" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Host "正在将目标分支 $BranchName 更新到最新状态（git pull）..."
+    $pull = Invoke-Git -RepoPath $RepoPath -Arguments @("-c", "pull.rebase=false", "pull") -AllowFailure
+    if ($pull.ExitCode -ne 0) {
+        throw "git pull 失败，目标分支未能更新到最新状态。请手动解决后重新运行：`n$($pull.Output)"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($pull.Output)) {
+        Write-Host $pull.Output
+    }
+}
+
 try {
     Write-Step "检查运行环境"
     if ($null -eq (Get-Command git -ErrorAction SilentlyContinue)) {
@@ -338,13 +425,43 @@ try {
 
     Write-Step "读取配置"
     $warehouse = Read-JsonFile -Path $WarehouseFile -Description "仓库配置文件 warehouse.json"
-    $warehouseProperties = @($warehouse.PSObject.Properties.Name)
-    if (($warehouseProperties -notcontains "beforeAddress") -or ($warehouseProperties -notcontains "backAddress")) {
-        throw "warehouse.json 必须同时包含 beforeAddress 和 backAddress。"
+    $projects = @{}
+    $projectKeys = New-Object System.Collections.ArrayList
+    foreach ($property in $warehouse.PSObject.Properties) {
+        $projects[$property.Name] = $property.Value
+        [void]$projectKeys.Add($property.Name)
     }
 
-    $sourcePath = Resolve-ConfiguredPath -ConfiguredPath ([string]$warehouse.beforeAddress)
-    $targetPath = Resolve-ConfiguredPath -ConfiguredPath ([string]$warehouse.backAddress)
+    Write-Step "选择要合并的项目"
+    $selectedKey = Select-Project -Projects $projects -ProjectKeys @($projectKeys) -RequestedName $ProjectName
+    Write-Host "已选择项目：$selectedKey" -ForegroundColor Green
+
+    $projectConfig = $projects[$selectedKey]
+    $projectProperties = @($projectConfig.PSObject.Properties.Name)
+    if (($projectProperties -notcontains "beforeAddress") -or ($projectProperties -notcontains "backAddress")) {
+        throw "项目 $selectedKey 必须同时包含 beforeAddress 和 backAddress。"
+    }
+
+    $sourcePath = Resolve-ConfiguredPath -ConfiguredPath ([string]$projectConfig.beforeAddress)
+    $targetPath = Resolve-ConfiguredPath -ConfiguredPath ([string]$projectConfig.backAddress)
+    if (($projectProperties -contains "commitRecordAddress") -and (-not [string]::IsNullOrWhiteSpace([string]$projectConfig.commitRecordAddress))) {
+        $recordDirectory = Resolve-ConfiguredPath -ConfiguredPath ([string]$projectConfig.commitRecordAddress)
+    }
+    else {
+        $recordDirectory = Join-Path $ScriptRoot ("gitCommitRecord" + [IO.Path]::DirectorySeparatorChar + $selectedKey)
+    }
+
+    # 项目可指定各自的需求编号文件（commitTextSearchAddress）；
+    # 同时兼容文档笔误写法 commitTextAddress；未配置时回退根目录默认 gitCommitText.json
+    $demandFile = $DemandFile
+    if (($projectProperties -contains "commitTextSearchAddress") -and (-not [string]::IsNullOrWhiteSpace([string]$projectConfig.commitTextSearchAddress))) {
+        $demandFile = Resolve-ConfiguredPath -ConfiguredPath ([string]$projectConfig.commitTextSearchAddress)
+    }
+    elseif (($projectProperties -contains "commitTextAddress") -and (-not [string]::IsNullOrWhiteSpace([string]$projectConfig.commitTextAddress))) {
+        $demandFile = Resolve-ConfiguredPath -ConfiguredPath ([string]$projectConfig.commitTextAddress)
+    }
+    Write-Host "需求编号文件：$demandFile"
+
     Assert-GitRepository -Path $sourcePath -Description "合并前项目"
     Assert-GitRepository -Path $targetPath -Description "合并后项目"
 
@@ -353,7 +470,7 @@ try {
     Write-Host "合并前：$sourcePath（分支：$sourceBranch）"
     Write-Host "合并后：$targetPath（分支：$targetBranch）"
 
-    $demandConfig = @(Read-JsonFile -Path $DemandFile -Description "需求配置文件 gitCommitText.json")
+    $demandConfig = @(Read-JsonFile -Path $demandFile -Description "需求配置文件（项目 $selectedKey）")
     if ($demandConfig.Count -eq 0) {
         throw "gitCommitText.json 中没有需求编号。"
     }
@@ -379,12 +496,11 @@ try {
 
     Write-Step "检索源分支提交记录"
     $allCommits = @(Get-SourceCommits -RepoPath $sourcePath -Branch $sourceBranch)
-    if (-not (Test-Path -LiteralPath $RecordDirectory -PathType Container)) {
-        [void](New-Item -ItemType Directory -Path $RecordDirectory)
+    if (-not (Test-Path -LiteralPath $recordDirectory -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $recordDirectory -Force)
     }
 
-    $projectName = Get-RepositoryName -RepoPath $sourcePath
-    $safeProjectName = Get-SafeFileNamePart -Value $projectName
+    $safeProjectKey = Get-SafeFileNamePart -Value $selectedKey
     $demandResults = New-Object System.Collections.ArrayList
 
     foreach ($demandNo in $demandNos) {
@@ -398,12 +514,13 @@ try {
                 [ordered]@{
                     commitText = $_.CommitText
                     commitId = $_.CommitId
+                    commitTime = $_.CommitTime
                 }
             })
         }
 
         $safeDemandNo = Get-SafeFileNamePart -Value $demandNo
-        $recordPath = Join-Path $RecordDirectory ("{0}_{1}.json" -f $safeProjectName, $safeDemandNo)
+        $recordPath = Join-Path $recordDirectory ("{0}_{1}.json" -f $safeProjectKey, $safeDemandNo)
         $record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $recordPath -Encoding UTF8
         Write-Host ("{0}：找到 {1} 条提交，记录已写入 {2}" -f $demandNo, $matches.Count, $recordPath)
 
@@ -447,10 +564,16 @@ try {
         Write-Host ("  {0}  {1}" -f $commit.CommitId.Substring(0, 12), $firstLine)
     }
 
-    $confirmation = (Read-Host "确认执行请输入 MERGE，其他任意输入取消").Trim()
-    if ($confirmation -cne "MERGE") {
-        Write-Host "确认未通过，本次未执行 cherry-pick。" -ForegroundColor Yellow
-        exit 0
+    while ($true) {
+        $answer = (Read-Host "`n[A] 开始合并  [B] 取消").Trim().ToUpperInvariant()
+        if ($answer -eq "A") {
+            break
+        }
+        if ($answer -eq "B") {
+            Write-Host "已取消，本次未执行 cherry-pick。" -ForegroundColor Yellow
+            exit 0
+        }
+        Write-Host "无效选项，请输入 A 或 B。" -ForegroundColor Yellow
     }
 
     Write-Step "执行合并前安全检查"
@@ -461,6 +584,14 @@ try {
         throw "目标项目分支已发生变化，请重新运行脚本。"
     }
     Assert-CleanWorkTree -RepoPath $targetPath
+
+    if (-not $SkipPull) {
+        Write-Step "更新目标分支到最新状态"
+        Update-TargetBranch -RepoPath $targetPath -BranchName $targetBranch
+    }
+    else {
+        Write-Host "已通过 -SkipPull 跳过目标分支更新。" -ForegroundColor Yellow
+    }
 
     Write-Host "从本地源仓库抓取提交对象（不会修改源项目，也不会 push）..."
     $fetchResult = Invoke-Git -RepoPath $targetPath -Arguments @("fetch", "--no-tags", $sourcePath, $sourceBranch)

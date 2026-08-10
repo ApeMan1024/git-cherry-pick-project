@@ -1,4 +1,14 @@
 {
-  "beforeAddress": "D:\\path\\to\\source-project",
-  "backAddress": "D:\\path\\to\\target-project"
+  "project-a": {
+    "beforeAddress": "D:\\path\\to\\source-project-a",
+    "backAddress": "D:\\path\\to\\target-project-a",
+    "commitRecordAddress": "gitCommitRecord/project-a/",
+    "commitTextSearchAddress": "commitTextSearch/project-a/gitCommitText.json"
+  },
+  "project-b": {
+    "beforeAddress": "D:\\path\\to\\source-project-b",
+    "backAddress": "D:\\path\\to\\target-project-b",
+    "commitRecordAddress": "gitCommitRecord/project-b/",
+    "commitTextSearchAddress": "commitTextSearch/project-b/gitCommitText.json"
+  }
 }
