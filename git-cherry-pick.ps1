@@ -266,12 +266,21 @@ function Resolve-CherryPickFailure {
 
         switch ($action) {
             "C" {
-                $continueResult = Invoke-Git -RepoPath $RepoPath -Arguments @("cherry-pick", "--continue") -AllowFailure
+                # 先检查是否仍有未解决的冲突文件（未执行 git add 的）
+                $unmerged = Invoke-Git -RepoPath $RepoPath -Arguments @("diff", "--name-only", "--diff-filter=U") -AllowFailure
+                if ($unmerged.ExitCode -eq 0 -and (-not [string]::IsNullOrWhiteSpace($unmerged.Output))) {
+                    Write-Host "仍存在未解决的冲突文件，请先在另一个终端处理并执行 git add 后再按 C：`n$($unmerged.Output)" -ForegroundColor Yellow
+                    continue
+                }
+
+                # -c core.editor=true 避免空提交场景弹出编辑器（如 vim）卡住脚本
+                $continueResult = Invoke-Git -RepoPath $RepoPath -Arguments @("-c", "core.editor=true", "cherry-pick", "--continue") -AllowFailure
                 if ($continueResult.ExitCode -eq 0) {
                     Write-Host "冲突已解决，提交 $CommitId 合并完成。" -ForegroundColor Green
                     return "Continued"
                 }
                 Write-Host $continueResult.Output -ForegroundColor Yellow
+                Write-Host "提示：若提示为空提交（empty），可考虑选 S 跳过该提交，或手动 git commit --allow-empty 后重试。" -ForegroundColor Yellow
             }
             "S" {
                 $skipResult = Invoke-Git -RepoPath $RepoPath -Arguments @("cherry-pick", "--skip") -AllowFailure
