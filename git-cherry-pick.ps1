@@ -243,7 +243,8 @@ function Get-UnmergedCommits {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
         [Parameter(Mandatory = $true)][string]$TargetHead,
-        [Parameter(Mandatory = $true)][object[]]$Commits
+        [Parameter(Mandatory = $true)][object[]]$Commits,
+        [object]$AppliedCommitIds
     )
 
     # 批量判断哪些提交尚未合并：
@@ -285,6 +286,10 @@ function Get-UnmergedCommits {
             continue
         }
         if ($patchApplied.Contains($commitId)) {
+            continue
+        }
+        # 外部已合清单（按需求编号记录的已合并提交），即使内容被改得与源提交不同也能识别，避免重复合并
+        if (($null -ne $AppliedCommitIds) -and $AppliedCommitIds.Contains($commitId)) {
             continue
         }
 
@@ -580,6 +585,189 @@ function Select-Demands {
     }
 }
 
+function Select-AppliedLists {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$DemandResults,
+        [Parameter(Mandatory = $true)]$AppliedMap
+    )
+
+    while ($true) {
+        Write-Host "`n检测到以下需求存在已合清单（加载后这些提交将被跳过，不再重复合并）："
+        for ($index = 0; $index -lt $DemandResults.Count; $index++) {
+            $item = $DemandResults[$index]
+            $appliedCount = 0
+            if ($AppliedMap.ContainsKey($item.DemandNo)) {
+                $appliedCount = @($AppliedMap[$item.DemandNo]).Count
+            }
+            Write-Host ("[{0}] {1}（已记录 {2} 条）" -f ($index + 1), $item.DemandNo, $appliedCount)
+        }
+        Write-Host "[A] 全部加载  [Q] 不加载（按原有 rev-list + git cherry 判断）"
+        $answer = Read-Choice -Prompt "请输入 A，或输入序号（多个序号用逗号分隔）"
+
+        if ($null -eq $answer) {
+            Write-Host "输入已结束，脚本退出。" -ForegroundColor Yellow
+            exit 2
+        }
+
+        if ($answer.ToUpperInvariant() -eq "Q") {
+            return @()
+        }
+
+        if ($answer.ToUpperInvariant() -eq "A") {
+            return @($DemandResults)
+        }
+
+        $normalized = $answer.Replace("，", ",")
+        $parts = @($normalized -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+        $selectedIndexes = New-Object System.Collections.ArrayList
+        $valid = ($parts.Count -gt 0)
+
+        foreach ($part in $parts) {
+            $number = 0
+            if ((-not [int]::TryParse($part, [ref]$number)) -or ($number -lt 1) -or ($number -gt $DemandResults.Count)) {
+                $valid = $false
+                break
+            }
+            if (-not $selectedIndexes.Contains($number - 1)) {
+                [void]$selectedIndexes.Add($number - 1)
+            }
+        }
+
+        if (-not $valid) {
+            Write-Host "输入无效，请使用 A、Q 或列表中的序号。" -ForegroundColor Yellow
+            continue
+        }
+
+        return @($selectedIndexes | ForEach-Object { $DemandResults[$_] })
+    }
+}
+
+function Save-AppliedList {
+    param(
+        [Parameter(Mandatory = $true)]$AppliedMap,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $output = New-Object System.Collections.ArrayList
+    foreach ($demandNo in ($AppliedMap.Keys | Sort-Object)) {
+        $list = $AppliedMap[$demandNo]
+        if (($null -eq $list) -or ($list.Count -eq 0)) {
+            continue
+        }
+        [void]$output.Add([ordered]@{
+            demandNo = $demandNo
+            appliedCommitIds = @($list | ForEach-Object { [ordered]@{ commitText = $_.commitText; commitId = $_.commitId } })
+        })
+    }
+    $output | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+function Record-NewlyApplied {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$SelectedCommits,
+        # 全部合完时 $UnmergedCommits 可能为空数组，不能设为 Mandatory（PowerShell 会拒绝空数组）
+        [object[]]$UnmergedCommits,
+        [Parameter(Mandatory = $true)]$UserSkippedIds,
+        [Parameter(Mandatory = $true)]$RecordedAppliedIds,
+        [Parameter(Mandatory = $true)]$AllAppliedIds,
+        [Parameter(Mandatory = $true)]$AppliedMap,
+        [Parameter(Mandatory = $true)]$CommitDemandMap,
+        [Parameter(Mandatory = $true)][string]$AppliedFilePath
+    )
+
+    $unmergedSet = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($c in $UnmergedCommits) {
+        [void]$unmergedSet.Add($c.CommitId)
+    }
+
+    $newly = New-Object System.Collections.ArrayList
+    foreach ($c in $SelectedCommits) {
+        $id = $c.CommitId
+        if ($unmergedSet.Contains($id)) { continue }
+        if ($UserSkippedIds.Contains($id)) { continue }
+        if ($RecordedAppliedIds.Contains($id)) { continue }
+        [void]$newly.Add($c)
+    }
+
+    if ($newly.Count -eq 0) {
+        return 0
+    }
+
+    foreach ($c in $newly) {
+        [void]$RecordedAppliedIds.Add($c.CommitId)
+        [void]$AllAppliedIds.Add($c.CommitId)
+        $demands = $CommitDemandMap[$c.CommitId]
+        if ($null -eq $demands) { $demands = @() }
+        foreach ($dem in $demands) {
+            if (-not $AppliedMap.ContainsKey($dem)) {
+                $AppliedMap[$dem] = New-Object System.Collections.ArrayList
+            }
+            $dup = $false
+            foreach ($existing in $AppliedMap[$dem]) {
+                if ([string]::Equals($existing.commitId, $c.CommitId, [StringComparison]::OrdinalIgnoreCase)) {
+                    $dup = $true
+                    break
+                }
+            }
+            if (-not $dup) {
+                [void]$AppliedMap[$dem].Add([ordered]@{ commitText = $c.CommitText; commitId = $c.CommitId })
+            }
+        }
+    }
+
+    Save-AppliedList -AppliedMap $AppliedMap -Path $AppliedFilePath
+    Write-Host ("已记录 {0} 条新合并提交到已合清单：$AppliedFilePath" -f $newly.Count) -ForegroundColor Green
+    return $newly.Count
+}
+
+function Assert-NoResidualCherryPick {
+    param([Parameter(Mandatory = $true)][string]$RepoPath)
+
+    $head = Get-CherryPickInProgressCommit -RepoPath $RepoPath
+    if ([string]::IsNullOrWhiteSpace($head)) {
+        return
+    }
+
+    $shortId = $head.Substring(0, [Math]::Min(12, $head.Length))
+    Write-Host "`n检测到目标仓库存在未完成的 cherry-pick 状态（CHERRY_PICK_HEAD = $shortId）。" -ForegroundColor Yellow
+    Write-Host "这会导致工作区不干净，脚本无法正常合并。" -ForegroundColor Yellow
+    while ($true) {
+        Write-Host "[A] 中止残留 cherry-pick（git cherry-pick --abort）并继续  [C] 我已手动处理完成，重新检测后继续  [E] 退出，我自行处理"
+        $answer = Read-Choice -Prompt "请选择"
+
+        if ($null -eq $answer) {
+            Write-Host "输入已结束，脚本退出。" -ForegroundColor Yellow
+            exit 2
+        }
+        $answer = $answer.ToUpperInvariant()
+
+        if ($answer -eq "A") {
+            $abort = Invoke-Git -RepoPath $RepoPath -Arguments @("cherry-pick", "--abort") -AllowFailure
+            if ($abort.ExitCode -ne 0) {
+                Write-Host $abort.Output -ForegroundColor Yellow
+                Write-Host "中止失败，请手动处理后再运行脚本。" -ForegroundColor Yellow
+                continue
+            }
+            Write-Host "已中止残留 cherry-pick，目标分支恢复到合并前状态。" -ForegroundColor Green
+            return
+        }
+        if ($answer -eq "C") {
+            $recheck = Get-CherryPickInProgressCommit -RepoPath $RepoPath
+            if ([string]::IsNullOrWhiteSpace($recheck)) {
+                Write-Host "残留状态已清除，继续后续步骤。" -ForegroundColor Green
+                return
+            }
+            Write-Host "CHERRY_PICK_HEAD 仍存在，请先完成或中止 cherry-pick 后再继续。" -ForegroundColor Yellow
+            continue
+        }
+        if ($answer -eq "E") {
+            Write-Host "已退出，请自行处理目标仓库的 cherry-pick 状态。" -ForegroundColor Yellow
+            exit 0
+        }
+        Write-Host "无效选项，请输入 A、C 或 E。" -ForegroundColor Yellow
+    }
+}
+
 function Update-TargetBranch {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
@@ -763,6 +951,77 @@ try {
     }
     $selectedCommits = @($allCommits | Where-Object { $selectedCommitIds.Contains($_.CommitId) })
 
+    # ===== 外部已合清单（按需求编号记录已合并提交，不污染任何提交消息）=====
+    $appliedFilePath = Join-Path $recordDirectory ("{0}_applied.json" -f $safeProjectKey)
+    $appliedMap = @{}   # demandNo -> ArrayList of @{ commitText, commitId }
+    if (Test-Path -LiteralPath $appliedFilePath -PathType Leaf) {
+        try {
+            $loadedApplied = Read-JsonFile -Path $appliedFilePath -Description "已合清单 $appliedFilePath"
+            $entries = @()
+            if ($loadedApplied -is [System.Array]) {
+                $entries = $loadedApplied
+            }
+            else {
+                $entries = @($loadedApplied)
+            }
+            foreach ($entry in $entries) {
+                $props = @($entry.PSObject.Properties.Name)
+                if ($props -notcontains "demandNo") { continue }
+                $dn = ([string]$entry.demandNo).Trim()
+                if ([string]::IsNullOrWhiteSpace($dn)) { continue }
+                $list = New-Object System.Collections.ArrayList
+                if ($props -contains "appliedCommitIds") {
+                    foreach ($c in $entry.appliedCommitIds) {
+                        $cprops = @($c.PSObject.Properties.Name)
+                        if (($cprops -contains "commitId") -and (-not [string]::IsNullOrWhiteSpace([string]$c.commitId))) {
+                            [void]$list.Add([ordered]@{ commitText = [string]$c.commitText; commitId = [string]$c.commitId })
+                        }
+                    }
+                }
+                $appliedMap[$dn] = $list
+            }
+        }
+        catch {
+            Write-Host "已合清单读取失败，将忽略：$($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    # 构建 提交ID -> 需求编号 映射（一个提交可能命中多个需求）
+    $commitDemandMap = @{}
+    foreach ($dr in $demandResults) {
+        foreach ($c in $dr.Commits) {
+            if (-not $commitDemandMap.ContainsKey($c.CommitId)) {
+                $commitDemandMap[$c.CommitId] = New-Object System.Collections.ArrayList
+            }
+            if (-not $commitDemandMap[$c.CommitId].Contains($dr.DemandNo)) {
+                [void]$commitDemandMap[$c.CommitId].Add($dr.DemandNo)
+            }
+        }
+    }
+
+    # 询问是否加载已有的已合清单（仅针对本次选中的、且存在清单的需求）
+    $trustedAppliedIds = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
+    $demandsWithList = @($selectedDemands | Where-Object { $appliedMap.ContainsKey($_.DemandNo) -and $appliedMap[$_.DemandNo].Count -gt 0 })
+    if ($demandsWithList.Count -gt 0) {
+        $loadedDemands = @(Select-AppliedLists -DemandResults $demandsWithList -AppliedMap $appliedMap)
+        foreach ($ld in $loadedDemands) {
+            foreach ($c in $appliedMap[$ld.DemandNo]) {
+                [void]$trustedAppliedIds.Add($c.commitId)
+            }
+        }
+    }
+
+    # 已合跟踪集合：受信任清单(加载的) + 本次运行过程中新记录的
+    $recordedAppliedIds = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
+    $allAppliedIds = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($id in $trustedAppliedIds) {
+        [void]$allAppliedIds.Add($id)
+    }
+
+    # 用户策略集合（跳过 / 合并完成的提交），供后续循环与记录使用
+    $userSkippedIds = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
+    $userMergedIds = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
+
     Write-Host "`n即将从 $sourceBranch 合并到 $targetBranch，共 $($selectedCommits.Count) 条提交（按源分支从旧到新）：" -ForegroundColor Cyan
     foreach ($commit in $selectedCommits) {
         $firstLine = ($commit.CommitText -split "`r?`n")[0]
@@ -788,6 +1047,7 @@ try {
     }
 
     Write-Step "执行合并前安全检查"
+    Assert-NoResidualCherryPick -RepoPath $targetPath
     if ((Get-CurrentBranch -RepoPath $sourcePath) -ne $sourceBranch) {
         throw "源项目分支已发生变化，请重新运行脚本。"
     }
@@ -811,8 +1071,10 @@ try {
     }
 
     # ===== 批量校验：一次 rev-list + 一次 git cherry，判断所有选中提交哪些已合并 =====
+    Write-Host "当前正在校验内容是否已经合并...." -ForegroundColor Cyan
     $targetHead = (Invoke-Git -RepoPath $targetPath -Arguments @("rev-parse", "HEAD")).Output.Trim()
-    $unmergedCommits = @(Get-UnmergedCommits -RepoPath $targetPath -TargetHead $targetHead -Commits $selectedCommits)
+    $unmergedCommits = @(Get-UnmergedCommits -RepoPath $targetPath -TargetHead $targetHead -Commits $selectedCommits -AppliedCommitIds $allAppliedIds)
+    $null = Record-NewlyApplied -SelectedCommits $selectedCommits -UnmergedCommits $unmergedCommits -UserSkippedIds $userSkippedIds -RecordedAppliedIds $recordedAppliedIds -AllAppliedIds $allAppliedIds -AppliedMap $appliedMap -CommitDemandMap $commitDemandMap -AppliedFilePath $appliedFilePath
     $autoSkippedCount = $selectedCommits.Count - $unmergedCommits.Count
     if ($autoSkippedCount -gt 0) {
         Write-Host "自动跳过已合并或补丁等价的提交 $autoSkippedCount 条。" -ForegroundColor Yellow
@@ -823,10 +1085,7 @@ try {
         exit 0
     }
 
-    $userSkippedIds = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
-    # 用户通过策略处理完成的提交（如 merge 提交以 -m 1 重试成功）。
-    # git cherry 无法识别 merge 提交的补丁等价，需显式排除，避免再次尝试。
-    $userMergedIds = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
+    # 注意：$userSkippedIds / $userMergedIds 已在前面（已合清单初始化处）创建，此处不再重复初始化。
     $stopRequested = $false
     $pending = New-Object System.Collections.ArrayList
     foreach ($commit in $unmergedCommits) {
@@ -836,6 +1095,7 @@ try {
     while (($pending.Count -gt 0) -and (-not $stopRequested)) {
         # 每批最多 100 个提交，避免单条 git 命令行过长
         $batchIds = @($pending | Select-Object -First 100 | ForEach-Object { $_.CommitId })
+        Write-Host "当前正在批量合并内容...." -ForegroundColor Cyan
         Write-Host "`n正在批量 cherry-pick $($batchIds.Count) 条提交（从旧到新）："
         foreach ($batchId in $batchIds) {
             Write-Host ("  " + $batchId.Substring(0, 12)) -ForegroundColor Cyan
@@ -845,47 +1105,49 @@ try {
         $pickResult = Invoke-Git -RepoPath $targetPath -Arguments $pickArgs -AllowFailure
         if ($pickResult.ExitCode -eq 0) {
             Write-Host "批量合并成功：$($batchIds.Count) 条提交。" -ForegroundColor Green
-            # 下一轮循环会重新校验剩余提交
-            continue
-        }
-        if (-not [string]::IsNullOrWhiteSpace($pickResult.Output)) {
-            Write-Host $pickResult.Output -ForegroundColor Yellow
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace((Get-CherryPickInProgressCommit -RepoPath $targetPath))) {
-            # 冲突 / 空提交：进入冲突处理循环（基于 CHERRY_PICK_HEAD 动态状态，外部处理完成会自动退出）
-            $resolution = Resolve-CherryPickConflict -RepoPath $targetPath -PickOutput $pickResult.Output
         }
         else {
-            # 未进入 cherry-pick 状态（例如 merge 提交未指定 -m）
-            $resolution = Resolve-NonSequencerFailure -RepoPath $targetPath -PickOutput $pickResult.Output -PendingIds $batchIds
-        }
+            if (-not [string]::IsNullOrWhiteSpace($pickResult.Output)) {
+                Write-Host $pickResult.Output -ForegroundColor Yellow
+            }
 
-        switch ($resolution.Action) {
-            "Aborted" { $stopRequested = $true }
-            "Exited" { $stopRequested = $true }
-            "Skipped" {
-                if (-not [string]::IsNullOrWhiteSpace($resolution.CommitId)) {
-                    [void]$userSkippedIds.Add($resolution.CommitId)
-                }
+            if (-not [string]::IsNullOrWhiteSpace((Get-CherryPickInProgressCommit -RepoPath $targetPath))) {
+                # 冲突 / 空提交：进入冲突处理循环（基于 CHERRY_PICK_HEAD 动态状态，外部处理完成会自动退出）
+                $resolution = Resolve-CherryPickConflict -RepoPath $targetPath -PickOutput $pickResult.Output
             }
-            "Retried" {
-                # merge 提交已通过 -m 1 等策略处理完成，显式记录避免重复尝试
-                if (-not [string]::IsNullOrWhiteSpace($resolution.CommitId)) {
-                    [void]$userMergedIds.Add($resolution.CommitId)
-                }
+            else {
+                # 未进入 cherry-pick 状态（例如 merge 提交未指定 -m）
+                $resolution = Resolve-NonSequencerFailure -RepoPath $targetPath -PickOutput $pickResult.Output -PendingIds $batchIds
             }
-            default {
-                # Continued / External：由下一轮重新校验决定
+
+            switch ($resolution.Action) {
+                "Aborted" { $stopRequested = $true }
+                "Exited" { $stopRequested = $true }
+                "Skipped" {
+                    if (-not [string]::IsNullOrWhiteSpace($resolution.CommitId)) {
+                        [void]$userSkippedIds.Add($resolution.CommitId)
+                    }
+                }
+                "Retried" {
+                    # merge 提交已通过 -m 1 等策略处理完成，显式记录避免重复尝试
+                    if (-not [string]::IsNullOrWhiteSpace($resolution.CommitId)) {
+                        [void]$userMergedIds.Add($resolution.CommitId)
+                    }
+                }
+                default {
+                    # Continued / External：由下一轮重新校验决定
+                }
             }
         }
 
         # 重新批量校验剩余待合并提交
+        Write-Host "当前正在重新校验内容是否已经合并...." -ForegroundColor Cyan
         $targetHead = (Invoke-Git -RepoPath $targetPath -Arguments @("rev-parse", "HEAD")).Output.Trim()
-        $unmergedCommits = @(Get-UnmergedCommits -RepoPath $targetPath -TargetHead $targetHead -Commits $selectedCommits)
+        $unmergedCommits = @(Get-UnmergedCommits -RepoPath $targetPath -TargetHead $targetHead -Commits $selectedCommits -AppliedCommitIds $allAppliedIds)
+        $null = Record-NewlyApplied -SelectedCommits $selectedCommits -UnmergedCommits $unmergedCommits -UserSkippedIds $userSkippedIds -RecordedAppliedIds $recordedAppliedIds -AllAppliedIds $allAppliedIds -AppliedMap $appliedMap -CommitDemandMap $commitDemandMap -AppliedFilePath $appliedFilePath
         $pending = New-Object System.Collections.ArrayList
         foreach ($commit in $unmergedCommits) {
-            if (($userSkippedIds.Contains($commit.CommitId)) -or ($userMergedIds.Contains($commit.CommitId))) {
+            if (($userSkippedIds.Contains($commit.CommitId)) -or ($userMergedIds.Contains($commit.CommitId)) -or ($allAppliedIds.Contains($commit.CommitId))) {
                 continue
             }
             [void]$pending.Add($commit)
