@@ -2,7 +2,9 @@
 param(
     [switch]$ScanOnly,
     [string]$ProjectName = "",
-    [switch]$SkipPull
+    [switch]$SkipPull,
+    [string]$WarehouseFile = "",
+    [string]$DemandFile = ""
 )
 
 Set-StrictMode -Version 2.0
@@ -16,12 +18,37 @@ try {
 catch { }
 
 $ScriptRoot = $PSScriptRoot
-$WarehouseFile = Join-Path $ScriptRoot "warehouse.json"
-$DemandFile = Join-Path $ScriptRoot "gitCommitText.json"
+
+# 配置文件路径：默认取脚本根目录，也允许通过 -WarehouseFile / -DemandFile 指定（验证时可用独立文件）
+if ([string]::IsNullOrWhiteSpace($WarehouseFile)) {
+    $WarehouseFile = Join-Path $ScriptRoot "warehouse.json"
+}
+elseif (-not [System.IO.Path]::IsPathRooted($WarehouseFile)) {
+    $WarehouseFile = Join-Path $ScriptRoot $WarehouseFile
+}
+$WarehouseFile = [System.IO.Path]::GetFullPath($WarehouseFile)
+
+if ([string]::IsNullOrWhiteSpace($DemandFile)) {
+    $DemandFile = Join-Path $ScriptRoot "gitCommitText.json"
+}
+elseif (-not [System.IO.Path]::IsPathRooted($DemandFile)) {
+    $DemandFile = Join-Path $ScriptRoot $DemandFile
+}
+$DemandFile = [System.IO.Path]::GetFullPath($DemandFile)
 
 function Write-Step {
     param([string]$Message)
     Write-Host "`n==> $Message" -ForegroundColor Cyan
+}
+
+function Read-Choice {
+    # 安全读取用户输入：管道/重定向场景下 Read-Host 可能返回 Null（EOF）
+    param([Parameter(Mandatory = $true)][string]$Prompt)
+    $value = Read-Host $Prompt
+    if ($null -eq $value) {
+        return $null
+    }
+    return $value.Trim()
 }
 
 function Invoke-Git {
@@ -212,57 +239,98 @@ function Get-SafeFileNamePart {
     return $safeValue
 }
 
-function Test-CommitAlreadyApplied {
+function Get-UnmergedCommits {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
-        [Parameter(Mandatory = $true)][string]$CommitId
+        [Parameter(Mandatory = $true)][string]$TargetHead,
+        [Parameter(Mandatory = $true)][object[]]$Commits
     )
 
-    $exists = Invoke-Git -RepoPath $RepoPath -Arguments @("cat-file", "-e", "$CommitId`^{commit}") -AllowFailure
-    if ($exists.ExitCode -ne 0) {
-        throw "目标仓库中不存在提交对象 $CommitId。请确认从源仓库 fetch 成功。"
+    # 批量判断哪些提交尚未合并：
+    # 1) 一次 rev-list 得到目标分支全部祖先提交集合（提交 ID 相同即已合并）
+    # 2) 一次 git cherry 得到补丁等价的提交集合（提交 ID 不同但内容相同也算已合并）
+    $ancestorResult = Invoke-Git -RepoPath $RepoPath -Arguments @("rev-list", $TargetHead) -AllowFailure
+    if ($ancestorResult.ExitCode -ne 0) {
+        throw "获取目标分支提交历史失败：$($ancestorResult.Output)"
+    }
+    $ancestors = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($line in ($ancestorResult.Output -split "`r?`n")) {
+        $hash = $line.Trim()
+        if ($hash -match "^[0-9a-f]{40}$") {
+            [void]$ancestors.Add($hash)
+        }
     }
 
-    $ancestor = Invoke-Git -RepoPath $RepoPath -Arguments @("merge-base", "--is-ancestor", $CommitId, "HEAD") -AllowFailure
-    if ($ancestor.ExitCode -eq 0) {
-        return $true
-    }
-
-    # git cherry 可识别提交 ID 不同但补丁内容相同的历史 cherry-pick。
-    $cherry = Invoke-Git -RepoPath $RepoPath -Arguments @("cherry", "HEAD", $CommitId) -AllowFailure
-    if ($cherry.ExitCode -eq 0) {
-        foreach ($line in ($cherry.Output -split "`r?`n")) {
-            if ($line -match ("^-\s+" + [Regex]::Escape($CommitId) + "(?:\s|$)")) {
-                return $true
+    # 源提交已通过 fetch 抓取到目标仓库（FETCH_HEAD 指向源分支）
+    $patchApplied = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
+    $cherryResult = Invoke-Git -RepoPath $RepoPath -Arguments @("cherry", $TargetHead, "FETCH_HEAD") -AllowFailure
+    if ($cherryResult.ExitCode -eq 0) {
+        foreach ($line in ($cherryResult.Output -split "`r?`n")) {
+            if ($line -match "^-\s+([0-9a-f]{40})") {
+                [void]$patchApplied.Add($Matches[1])
             }
         }
     }
 
-    return $false
+    $unmerged = New-Object System.Collections.ArrayList
+    foreach ($commit in $Commits) {
+        $commitId = $commit.CommitId
+
+        $exists = Invoke-Git -RepoPath $RepoPath -Arguments @("cat-file", "-e", "$commitId`^{commit}") -AllowFailure
+        if ($exists.ExitCode -ne 0) {
+            throw "目标仓库中不存在提交对象 $commitId。请确认从源仓库 fetch 成功。"
+        }
+
+        if ($ancestors.Contains($commitId)) {
+            continue
+        }
+        if ($patchApplied.Contains($commitId)) {
+            continue
+        }
+
+        [void]$unmerged.Add($commit)
+    }
+
+    return @($unmerged)
 }
 
-function Test-CherryPickInProgress {
+function Get-CherryPickInProgressCommit {
     param([Parameter(Mandatory = $true)][string]$RepoPath)
 
     $state = Invoke-Git -RepoPath $RepoPath -Arguments @("rev-parse", "--quiet", "--verify", "CHERRY_PICK_HEAD") -AllowFailure
-    return ($state.ExitCode -eq 0)
+    if ($state.ExitCode -ne 0) {
+        return ""
+    }
+    return $state.Output.Trim()
 }
 
-function Resolve-CherryPickFailure {
+function Resolve-CherryPickConflict {
     param(
         [Parameter(Mandatory = $true)][string]$RepoPath,
-        [Parameter(Mandatory = $true)][string]$CommitId
+        [Parameter(Mandatory = $true)][string]$PickOutput
     )
 
-    if (-not (Test-CherryPickInProgress -RepoPath $RepoPath)) {
-        throw "提交 $CommitId 合并失败，且 Git 未进入可继续的 cherry-pick 状态。请检查上方错误信息。"
-    }
-
+    # 处理进行中的 cherry-pick（冲突 / 空提交）。
+    # 循环条件基于 CHERRY_PICK_HEAD 动态状态：外部处理完成后会自动退出，避免死循环。
     while ($true) {
-        Write-Host "`n提交 $CommitId 发生冲突或产生空提交。" -ForegroundColor Yellow
+        $currentId = Get-CherryPickInProgressCommit -RepoPath $RepoPath
+        if ([string]::IsNullOrWhiteSpace($currentId)) {
+            # 说明用户在外部已手动完成或中止了 cherry-pick
+            Write-Host "检测到 cherry-pick 已在外部处理完成，脚本继续后续步骤。" -ForegroundColor Yellow
+            return [PSCustomObject]@{ Action = "External"; CommitId = "" }
+        }
+        $shortId = $currentId.Substring(0, [Math]::Min(12, $currentId.Length))
+
+        Write-Host "`n提交 $shortId 发生冲突或产生空提交。" -ForegroundColor Yellow
         Write-Host "请在另一个终端或编辑器中解决冲突，并执行 git add；不要手动执行 git cherry-pick --continue。"
         Write-Host "[C] 已处理，继续  [S] 跳过该提交  [A] 中止本次全部合并  [E] 保留现场并退出"
-        $action = (Read-Host "请选择").Trim().ToUpperInvariant()
+        $action = Read-Choice -Prompt "请选择"
+
+        if ($null -eq $action) {
+            Write-Host "输入已结束，脚本退出。" -ForegroundColor Yellow
+            exit 2
+        }
+        $action = $action.ToUpperInvariant()
 
         switch ($action) {
             "C" {
@@ -275,21 +343,35 @@ function Resolve-CherryPickFailure {
 
                 # -c core.editor=true 避免空提交场景弹出编辑器（如 vim）卡住脚本
                 $continueResult = Invoke-Git -RepoPath $RepoPath -Arguments @("-c", "core.editor=true", "cherry-pick", "--continue") -AllowFailure
-                if ($continueResult.ExitCode -eq 0) {
-                    Write-Host "冲突已解决，提交 $CommitId 合并完成。" -ForegroundColor Green
-                    return "Continued"
+                if ($continueResult.ExitCode -ne 0) {
+                    Write-Host $continueResult.Output -ForegroundColor Yellow
+                    Write-Host "提示：若提示为空提交（empty），可考虑选 S 跳过该提交，或手动 git commit --allow-empty 后重试。" -ForegroundColor Yellow
+                    continue
                 }
-                Write-Host $continueResult.Output -ForegroundColor Yellow
-                Write-Host "提示：若提示为空提交（empty），可考虑选 S 跳过该提交，或手动 git commit --allow-empty 后重试。" -ForegroundColor Yellow
+
+                # --continue 成功：若 sequencer 已全部完成则返回；若又停在下一处冲突则循环继续处理
+                if ([string]::IsNullOrWhiteSpace((Get-CherryPickInProgressCommit -RepoPath $RepoPath))) {
+                    Write-Host "冲突已解决，提交 $shortId 合并完成。" -ForegroundColor Green
+                    return [PSCustomObject]@{ Action = "Continued"; CommitId = $currentId }
+                }
             }
             "S" {
                 $skipResult = Invoke-Git -RepoPath $RepoPath -Arguments @("cherry-pick", "--skip") -AllowFailure
                 if ($skipResult.ExitCode -ne 0) {
                     Write-Host $skipResult.Output -ForegroundColor Yellow
+                    # 若 --skip 失败且 cherry-pick 已不在进行中（外部已处理），立即退出循环
+                    if ([string]::IsNullOrWhiteSpace((Get-CherryPickInProgressCommit -RepoPath $RepoPath))) {
+                        Write-Host "检测到 cherry-pick 已在外部处理完成，脚本继续后续步骤。" -ForegroundColor Yellow
+                        return [PSCustomObject]@{ Action = "External"; CommitId = "" }
+                    }
                     continue
                 }
-                Write-Host "已跳过提交 $CommitId。" -ForegroundColor Yellow
-                return "Skipped"
+
+                Write-Host "已跳过提交 $shortId。" -ForegroundColor Yellow
+                # --skip 后 sequencer 自动继续；若全部完成则返回，若又停在冲突处则循环继续处理
+                if ([string]::IsNullOrWhiteSpace((Get-CherryPickInProgressCommit -RepoPath $RepoPath))) {
+                    return [PSCustomObject]@{ Action = "Skipped"; CommitId = $currentId }
+                }
             }
             "A" {
                 $abortResult = Invoke-Git -RepoPath $RepoPath -Arguments @("cherry-pick", "--abort") -AllowFailure
@@ -297,16 +379,100 @@ function Resolve-CherryPickFailure {
                     throw "中止 cherry-pick 失败：`n$($abortResult.Output)"
                 }
                 Write-Host "已中止本轮 cherry-pick，并恢复到合并前状态。" -ForegroundColor Yellow
-                return "Aborted"
+                return [PSCustomObject]@{ Action = "Aborted"; CommitId = "" }
             }
             "E" {
                 Write-Host "脚本已退出，冲突现场被保留。稍后请手动继续或中止 cherry-pick。" -ForegroundColor Yellow
-                return "Exited"
+                return [PSCustomObject]@{ Action = "Exited"; CommitId = "" }
             }
             default {
                 Write-Host "无效选项，请输入 C、S、A 或 E。" -ForegroundColor Yellow
             }
         }
+    }
+}
+
+function Resolve-NonSequencerFailure {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$PickOutput,
+        [Parameter(Mandatory = $true)][string[]]$PendingIds
+    )
+
+    # 处理未进入 cherry-pick 状态的失败，例如：merge 提交未指定 -m。
+    # 从输出中提取失败提交 id
+    $failedId = ""
+    if ($PickOutput -match "commit\s+([0-9a-f]{40,})\s+is a merge") {
+        $failedId = $Matches[1]
+    }
+
+    while ($true) {
+        if (-not [string]::IsNullOrWhiteSpace($failedId)) {
+            Write-Host "`n提交 $failedId 是合并提交（merge commit），直接 cherry-pick 需要指定 -m 参数。" -ForegroundColor Yellow
+            Write-Host "[M] 以 -m 1 合并该提交（取第一个父分支的变更）  [S] 跳过该提交，继续后续  [A] 中止本次全部合并  [E] 保留现场并退出"
+        }
+        else {
+            Write-Host "`n合并失败且未进入可继续的 cherry-pick 状态（可能为其它 Git 错误）。" -ForegroundColor Yellow
+            Write-Host "[C] 我已手动处理完成，继续  [S] 跳过该提交  [A] 中止本次全部合并  [E] 保留现场并退出"
+        }
+        $action = Read-Choice -Prompt "请选择"
+
+        if ($null -eq $action) {
+            Write-Host "输入已结束，脚本退出。" -ForegroundColor Yellow
+            exit 2
+        }
+        $action = $action.ToUpperInvariant()
+
+        if ($action -eq "M" -and (-not [string]::IsNullOrWhiteSpace($failedId))) {
+            $retry = Invoke-Git -RepoPath $RepoPath -Arguments @("cherry-pick", "-m", "1", $failedId) -AllowFailure
+            if ($retry.ExitCode -eq 0) {
+                Write-Host "以 -m 1 合并提交 $failedId 成功。" -ForegroundColor Green
+                return [PSCustomObject]@{ Action = "Retried"; CommitId = $failedId }
+            }
+            Write-Host $retry.Output -ForegroundColor Yellow
+            # -m 1 重试可能引发冲突：进入冲突处理
+            if (-not [string]::IsNullOrWhiteSpace((Get-CherryPickInProgressCommit -RepoPath $RepoPath))) {
+                $conflictResolution = Resolve-CherryPickConflict -RepoPath $RepoPath -PickOutput $retry.Output
+                if (($conflictResolution.Action -eq "Aborted") -or ($conflictResolution.Action -eq "Exited")) {
+                    return $conflictResolution
+                }
+                return [PSCustomObject]@{ Action = "Retried"; CommitId = $failedId }
+            }
+            continue
+        }
+
+        if ($action -eq "S") {
+            $skipId = $failedId
+            if ([string]::IsNullOrWhiteSpace($skipId)) {
+                # 未知失败：跳过 pending 中的第一个提交（最可能是失败的那个）
+                $skipId = $PendingIds[0]
+            }
+            Write-Host "已跳过提交 $skipId。" -ForegroundColor Yellow
+            return [PSCustomObject]@{ Action = "Skipped"; CommitId = $skipId }
+        }
+
+        if ($action -eq "C" -and [string]::IsNullOrWhiteSpace($failedId)) {
+            # 用户声明已手动处理完成：由主流程重新批量校验决定下一步
+            Write-Host "已确认，继续后续步骤。" -ForegroundColor Yellow
+            return [PSCustomObject]@{ Action = "Continued"; CommitId = "" }
+        }
+
+        if ($action -eq "A") {
+            $abortResult = Invoke-Git -RepoPath $RepoPath -Arguments @("cherry-pick", "--abort") -AllowFailure
+            if ($abortResult.ExitCode -eq 0) {
+                Write-Host "已中止本轮 cherry-pick，并恢复到合并前状态。" -ForegroundColor Yellow
+                return [PSCustomObject]@{ Action = "Aborted"; CommitId = "" }
+            }
+            Write-Host $abortResult.Output -ForegroundColor Yellow
+            continue
+        }
+
+        if ($action -eq "E") {
+            Write-Host "脚本已退出，请检查目标仓库状态后手动处理。" -ForegroundColor Yellow
+            return [PSCustomObject]@{ Action = "Exited"; CommitId = "" }
+        }
+
+        Write-Host "无效选项，请重新输入。" -ForegroundColor Yellow
     }
 }
 
@@ -337,7 +503,12 @@ function Select-Project {
             Write-Host ("[{0}] {1}" -f ($index + 1), $keys[$index])
         }
         Write-Host "[Q] 退出"
-        $answer = (Read-Host "请选择要合并的项目序号").Trim()
+        $answer = Read-Choice -Prompt "请选择要合并的项目序号"
+
+        if ($null -eq $answer) {
+            Write-Host "输入已结束，脚本退出。" -ForegroundColor Yellow
+            exit 2
+        }
 
         if ($answer.ToUpperInvariant() -eq "Q") {
             exit 0
@@ -362,7 +533,12 @@ function Select-Demands {
             Write-Host ("[{0}] {1}（{2} 条提交）" -f ($index + 1), $item.DemandNo, $item.Commits.Count)
         }
         Write-Host "[A] 合并全部有提交的需求  [Q] 退出，不合并"
-        $answer = (Read-Host "请输入 A，或输入序号（多个序号用逗号分隔）").Trim()
+        $answer = Read-Choice -Prompt "请输入 A，或输入序号（多个序号用逗号分隔）"
+
+        if ($null -eq $answer) {
+            Write-Host "输入已结束，脚本退出。" -ForegroundColor Yellow
+            exit 2
+        }
 
         if ($answer.ToUpperInvariant() -eq "Q") {
             return @()
@@ -419,7 +595,27 @@ function Update-TargetBranch {
     Write-Host "正在将目标分支 $BranchName 更新到最新状态（git pull）..."
     $pull = Invoke-Git -RepoPath $RepoPath -Arguments @("-c", "pull.rebase=false", "pull") -AllowFailure
     if ($pull.ExitCode -ne 0) {
-        throw "git pull 失败，目标分支未能更新到最新状态。请手动解决后重新运行：`n$($pull.Output)"
+        Write-Host "`ngit pull 执行失败，目标分支未能自动更新到最新状态。请手动在另一个终端处理（例如解决冲突、完成拉取或检查网络）。" -ForegroundColor Yellow
+        Write-Host "失败信息如下：" -ForegroundColor Yellow
+        Write-Host $pull.Output -ForegroundColor Yellow
+        while ($true) {
+            $answer = Read-Choice -Prompt "[Y] 我已手动处理完成，确认继续  [Q] 退出"
+
+        if ($null -eq $answer) {
+            Write-Host "输入已结束，脚本退出。" -ForegroundColor Yellow
+            exit 2
+        }
+            $answer = $answer.ToUpperInvariant()
+            if ($answer -eq "Y") {
+                Write-Host "已确认，继续后续合并步骤。" -ForegroundColor Green
+                return
+            }
+            if ($answer -eq "Q") {
+                Write-Host "已退出，未执行 cherry-pick。" -ForegroundColor Yellow
+                exit 0
+            }
+            Write-Host "无效选项，请输入 Y 或 Q。" -ForegroundColor Yellow
+        }
     }
     if (-not [string]::IsNullOrWhiteSpace($pull.Output)) {
         Write-Host $pull.Output
@@ -574,7 +770,13 @@ try {
     }
 
     while ($true) {
-        $answer = (Read-Host "`n[A] 开始合并  [B] 取消").Trim().ToUpperInvariant()
+        $answer = Read-Choice -Prompt "`n[A] 开始合并  [B] 取消"
+
+        if ($null -eq $answer) {
+            Write-Host "输入已结束，脚本退出。" -ForegroundColor Yellow
+            exit 2
+        }
+        $answer = $answer.ToUpperInvariant()
         if ($answer -eq "A") {
             break
         }
@@ -608,41 +810,96 @@ try {
         Write-Host $fetchResult.Output
     }
 
-    $mergedCount = 0
-    $skippedCount = 0
-    foreach ($commit in $selectedCommits) {
-        $commitId = $commit.CommitId
-        if (Test-CommitAlreadyApplied -RepoPath $targetPath -CommitId $commitId) {
-            Write-Host "跳过已合并或补丁等价的提交：$commitId" -ForegroundColor Yellow
-            $skippedCount++
-            continue
+    # ===== 批量校验：一次 rev-list + 一次 git cherry，判断所有选中提交哪些已合并 =====
+    $targetHead = (Invoke-Git -RepoPath $targetPath -Arguments @("rev-parse", "HEAD")).Output.Trim()
+    $unmergedCommits = @(Get-UnmergedCommits -RepoPath $targetPath -TargetHead $targetHead -Commits $selectedCommits)
+    $autoSkippedCount = $selectedCommits.Count - $unmergedCommits.Count
+    if ($autoSkippedCount -gt 0) {
+        Write-Host "自动跳过已合并或补丁等价的提交 $autoSkippedCount 条。" -ForegroundColor Yellow
+    }
+    if ($unmergedCommits.Count -eq 0) {
+        Write-Host "`n所有选中提交均已合并过，无需执行 cherry-pick。" -ForegroundColor Green
+        Write-Host "当前目标分支：$targetBranch。脚本未执行 git push，请检查结果后自行推送。"
+        exit 0
+    }
+
+    $userSkippedIds = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
+    # 用户通过策略处理完成的提交（如 merge 提交以 -m 1 重试成功）。
+    # git cherry 无法识别 merge 提交的补丁等价，需显式排除，避免再次尝试。
+    $userMergedIds = New-Object "System.Collections.Generic.HashSet[string]" ([StringComparer]::OrdinalIgnoreCase)
+    $stopRequested = $false
+    $pending = New-Object System.Collections.ArrayList
+    foreach ($commit in $unmergedCommits) {
+        [void]$pending.Add($commit)
+    }
+
+    while (($pending.Count -gt 0) -and (-not $stopRequested)) {
+        # 每批最多 100 个提交，避免单条 git 命令行过长
+        $batchIds = @($pending | Select-Object -First 100 | ForEach-Object { $_.CommitId })
+        Write-Host "`n正在批量 cherry-pick $($batchIds.Count) 条提交（从旧到新）："
+        foreach ($batchId in $batchIds) {
+            Write-Host ("  " + $batchId.Substring(0, 12)) -ForegroundColor Cyan
         }
 
-        Write-Host "正在 cherry-pick：$commitId" -ForegroundColor Cyan
-        $pickResult = Invoke-Git -RepoPath $targetPath -Arguments @("cherry-pick", $commitId) -AllowFailure
+        $pickArgs = @("cherry-pick") + $batchIds
+        $pickResult = Invoke-Git -RepoPath $targetPath -Arguments $pickArgs -AllowFailure
         if ($pickResult.ExitCode -eq 0) {
-            Write-Host "合并成功：$commitId" -ForegroundColor Green
-            $mergedCount++
+            Write-Host "批量合并成功：$($batchIds.Count) 条提交。" -ForegroundColor Green
+            # 下一轮循环会重新校验剩余提交
             continue
         }
-
         if (-not [string]::IsNullOrWhiteSpace($pickResult.Output)) {
             Write-Host $pickResult.Output -ForegroundColor Yellow
         }
-        $resolution = Resolve-CherryPickFailure -RepoPath $targetPath -CommitId $commitId
-        if ($resolution -eq "Continued") {
-            $mergedCount++
+
+        if (-not [string]::IsNullOrWhiteSpace((Get-CherryPickInProgressCommit -RepoPath $targetPath))) {
+            # 冲突 / 空提交：进入冲突处理循环（基于 CHERRY_PICK_HEAD 动态状态，外部处理完成会自动退出）
+            $resolution = Resolve-CherryPickConflict -RepoPath $targetPath -PickOutput $pickResult.Output
         }
-        elseif ($resolution -eq "Skipped") {
-            $skippedCount++
+        else {
+            # 未进入 cherry-pick 状态（例如 merge 提交未指定 -m）
+            $resolution = Resolve-NonSequencerFailure -RepoPath $targetPath -PickOutput $pickResult.Output -PendingIds $batchIds
         }
-        elseif (($resolution -eq "Aborted") -or ($resolution -eq "Exited")) {
-            Write-Host "`n合并流程已停止。未执行 git push。" -ForegroundColor Yellow
-            exit 2
+
+        switch ($resolution.Action) {
+            "Aborted" { $stopRequested = $true }
+            "Exited" { $stopRequested = $true }
+            "Skipped" {
+                if (-not [string]::IsNullOrWhiteSpace($resolution.CommitId)) {
+                    [void]$userSkippedIds.Add($resolution.CommitId)
+                }
+            }
+            "Retried" {
+                # merge 提交已通过 -m 1 等策略处理完成，显式记录避免重复尝试
+                if (-not [string]::IsNullOrWhiteSpace($resolution.CommitId)) {
+                    [void]$userMergedIds.Add($resolution.CommitId)
+                }
+            }
+            default {
+                # Continued / External：由下一轮重新校验决定
+            }
+        }
+
+        # 重新批量校验剩余待合并提交
+        $targetHead = (Invoke-Git -RepoPath $targetPath -Arguments @("rev-parse", "HEAD")).Output.Trim()
+        $unmergedCommits = @(Get-UnmergedCommits -RepoPath $targetPath -TargetHead $targetHead -Commits $selectedCommits)
+        $pending = New-Object System.Collections.ArrayList
+        foreach ($commit in $unmergedCommits) {
+            if (($userSkippedIds.Contains($commit.CommitId)) -or ($userMergedIds.Contains($commit.CommitId))) {
+                continue
+            }
+            [void]$pending.Add($commit)
         }
     }
 
-    Write-Host "`n全部处理完成：成功合并 $mergedCount 条，跳过 $skippedCount 条。" -ForegroundColor Green
+    if ($stopRequested) {
+        Write-Host "`n合并流程已停止。剩余 $($pending.Count) 条提交未合并。未执行 git push。" -ForegroundColor Yellow
+        exit 2
+    }
+
+    $skippedTotal = $autoSkippedCount + @($userSkippedIds | Where-Object { $selectedCommitIds.Contains($_) }).Count
+    $mergedCount = $selectedCommits.Count - $skippedTotal - $pending.Count
+    Write-Host "`n全部处理完成：成功合并 $mergedCount 条，跳过 $skippedTotal 条。" -ForegroundColor Green
     Write-Host "当前目标分支：$targetBranch。脚本未执行 git push，请检查结果后自行推送。"
 }
 catch {
