@@ -810,6 +810,106 @@ function Update-TargetBranch {
     }
 }
 
+function Invoke-PushAfterMerge {
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [Parameter(Mandatory = $true)][string]$BranchName
+    )
+
+    # 阶段一：询问合并完成后是否执行 push
+    while ($true) {
+        Write-Host "`n内容合并已完成，是否执行 git push 推送？"
+        Write-Host "[A] 执行 git push 推送（分支：$BranchName）  [B] 结束程序，不推送"
+        $answer = Read-Choice -Prompt "请选择"
+        if ($null -eq $answer) {
+            Write-Host "输入已结束，脚本退出。" -ForegroundColor Yellow
+            exit 2
+        }
+        $answer = $answer.ToUpperInvariant()
+        if ($answer -eq "A") {
+            break
+        }
+        if ($answer -eq "B") {
+            Write-Host "`n程序结束，未执行 git push。请检查合并结果后自行推送。" -ForegroundColor Yellow
+            exit 0
+        }
+        Write-Host "无效选项，请输入 A 或 B。" -ForegroundColor Yellow
+    }
+
+    # 阶段二：确定推送目标。优先使用已配置的上游分支（@{u}）；未配置时询问是否以第一个远端做首次推送
+    $pushArgs = @()
+    $upstream = Invoke-Git -RepoPath $RepoPath -Arguments @("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}") -AllowFailure
+    if ($upstream.ExitCode -eq 0) {
+        Write-Host "检测到上游分支：$($upstream.Output.Trim())" -ForegroundColor Cyan
+    }
+    else {
+        Write-Host "目标分支 $BranchName 未配置上游分支（@{u}）。" -ForegroundColor Yellow
+        $remotes = Invoke-Git -RepoPath $RepoPath -Arguments @("remote") -AllowFailure
+        $remoteNames = @()
+        if ($remotes.ExitCode -eq 0) {
+            $remoteNames = @($remotes.Output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+        }
+        if ($remoteNames.Count -eq 0) {
+            Write-Host "目标仓库未配置任何远程仓库（git remote），无法执行 push。" -ForegroundColor Yellow
+            exit 0
+        }
+        $remoteName = $remoteNames[0]
+        while ($true) {
+            Write-Host "[U] 以 git push -u $remoteName $BranchName 推送并设置上游  [B] 结束程序，不推送"
+            $answer = Read-Choice -Prompt "请选择"
+            if ($null -eq $answer) {
+                Write-Host "输入已结束，脚本退出。" -ForegroundColor Yellow
+                exit 2
+            }
+            $answer = $answer.ToUpperInvariant()
+            if ($answer -eq "U") {
+                $pushArgs = @("-u", $remoteName, $BranchName)
+                break
+            }
+            if ($answer -eq "B") {
+                Write-Host "`n程序结束，未执行 git push。请检查合并结果后自行推送。" -ForegroundColor Yellow
+                exit 0
+            }
+            Write-Host "无效选项，请输入 U 或 B。" -ForegroundColor Yellow
+        }
+    }
+
+    # 阶段三：执行推送，失败可重试
+    while ($true) {
+        Write-Host "`n正在执行 git push（分支：$BranchName）..."
+        $push = Invoke-Git -RepoPath $RepoPath -Arguments (@("push") + $pushArgs) -AllowFailure
+        if ($push.ExitCode -eq 0) {
+            if (-not [string]::IsNullOrWhiteSpace($push.Output)) {
+                Write-Host $push.Output
+            }
+            Write-Host "`ngit push 成功，分支 $BranchName 已推送至远端。" -ForegroundColor Green
+            return
+        }
+        if (-not [string]::IsNullOrWhiteSpace($push.Output)) {
+            Write-Host $push.Output -ForegroundColor Yellow
+        }
+        Write-Host "`ngit push 执行失败。请检查网络连接、登录凭据或远端状态。" -ForegroundColor Yellow
+        Write-Host "若提示非快进（non-fast-forward）失败，请先在另一个终端处理（如 git pull）后再重试。" -ForegroundColor Yellow
+        while ($true) {
+            Write-Host "[R] 重试 push  [B] 结束程序，不推送"
+            $answer = Read-Choice -Prompt "请选择"
+            if ($null -eq $answer) {
+                Write-Host "输入已结束，脚本退出。" -ForegroundColor Yellow
+                exit 2
+            }
+            $answer = $answer.ToUpperInvariant()
+            if ($answer -eq "R") {
+                break
+            }
+            if ($answer -eq "B") {
+                Write-Host "`n程序结束，未执行 git push。请检查合并结果后自行推送。" -ForegroundColor Yellow
+                exit 0
+            }
+            Write-Host "无效选项，请输入 R 或 B。" -ForegroundColor Yellow
+        }
+    }
+}
+
 try {
     Write-Step "检查运行环境"
     if ($null -eq (Get-Command git -ErrorAction SilentlyContinue)) {
@@ -1162,7 +1262,10 @@ try {
     $skippedTotal = $autoSkippedCount + @($userSkippedIds | Where-Object { $selectedCommitIds.Contains($_) }).Count
     $mergedCount = $selectedCommits.Count - $skippedTotal - $pending.Count
     Write-Host "`n全部处理完成：成功合并 $mergedCount 条，跳过 $skippedTotal 条。" -ForegroundColor Green
-    Write-Host "当前目标分支：$targetBranch。脚本未执行 git push，请检查结果后自行推送。"
+    Write-Host "当前目标分支：$targetBranch。"
+
+    # 合并完成后询问：执行 push 推送，还是结束程序
+    Invoke-PushAfterMerge -RepoPath $targetPath -BranchName $targetBranch
 }
 catch {
     Write-Host "`n执行失败：$($_.Exception.Message)" -ForegroundColor Red
