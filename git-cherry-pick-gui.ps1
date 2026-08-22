@@ -579,7 +579,8 @@ function Merge-Scan {
     $demandSet = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($dn in $m.DemandNos) { [void]$demandSet.Add($dn) }
 
-    $seenCommit = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    # 汇总所有需求命中的提交 ID（同一提交可能命中多个需求编号）
+    $selectedCommitIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($dn in $m.DemandNos) {
         $matches = @($allCommits | Where-Object { Test-DemandIncludedExactlyGui -CommitMessage $_.CommitText -DemandNo $dn })
         $safeDn  = Get-SafeFileNamePartGui -Value $dn
@@ -594,17 +595,21 @@ function Merge-Scan {
         Add-Log ("需求 {0}：找到 {1} 条提交，记录已写入 {2}" -f $dn, $matches.Count, $recordPath) ([System.Drawing.Color]::Gray)
 
         foreach ($c in $matches) {
+            # 提交 -> 需求编号映射（用于按需求写入已合清单），同一提交可能命中多个需求
             if (-not $m.CommitDemandMap.ContainsKey($c.CommitId)) {
                 $m.CommitDemandMap[$c.CommitId] = New-Object System.Collections.ArrayList
             }
             if (-not $m.CommitDemandMap[$c.CommitId].Contains($dn)) {
                 [void]$m.CommitDemandMap[$c.CommitId].Add($dn)
             }
-            if ($seenCommit.Add($c.CommitId)) {
-                [void]$m.AllCommits.Add($c)
-            }
+            [void]$selectedCommitIds.Add($c.CommitId)
         }
     }
+
+    # 对齐命令行脚本的合并策略：先汇总所有需求命中的提交，再按源分支原始提交时间
+    # （$allCommits 由 git log --reverse 取得，严格从旧到新）统一排序，而不是按需求编号
+    # 顺序拼接。这样可以避免跨需求的提交因排序错位而产生不必要的冲突。
+    $m.AllCommits = @($allCommits | Where-Object { $selectedCommitIds.Contains($_.CommitId) })
 
     if ($m.AllCommits.Count -eq 0) {
         Add-Log '所有需求均未检索到符合条件的提交，不执行合并。' ([System.Drawing.Color]::Yellow)
