@@ -689,7 +689,18 @@ function Record-NewlyApplied {
         [void]$newly.Add($c)
     }
 
-    if ($newly.Count -eq 0) {
+    # 把"被跳过"的提交也持久化进已合清单，避免下次运行因缺少记录而重复尝试同一提交，
+    # 陷入"冲突/空提交 -> 跳过 -> 不落盘 -> 再冲突"的死循环。
+    # （跳过即代表本次不纳入、后续也不再重试，其语义与"已合并"一致，都应被排除。）
+    $skipNewly = New-Object System.Collections.ArrayList
+    foreach ($c in $SelectedCommits) {
+        $id = $c.CommitId
+        if (-not $UserSkippedIds.Contains($id)) { continue }
+        if ($RecordedAppliedIds.Contains($id)) { continue }
+        [void]$skipNewly.Add($c)
+    }
+
+    if (($newly.Count -eq 0) -and ($skipNewly.Count -eq 0)) {
         return 0
     }
 
@@ -715,9 +726,31 @@ function Record-NewlyApplied {
         }
     }
 
+    foreach ($c in $skipNewly) {
+        [void]$RecordedAppliedIds.Add($c.CommitId)
+        [void]$AllAppliedIds.Add($c.CommitId)
+        $demands = $CommitDemandMap[$c.CommitId]
+        if ($null -eq $demands) { $demands = @() }
+        foreach ($dem in $demands) {
+            if (-not $AppliedMap.ContainsKey($dem)) {
+                $AppliedMap[$dem] = New-Object System.Collections.ArrayList
+            }
+            $dup = $false
+            foreach ($existing in $AppliedMap[$dem]) {
+                if ([string]::Equals($existing.commitId, $c.CommitId, [StringComparison]::OrdinalIgnoreCase)) {
+                    $dup = $true
+                    break
+                }
+            }
+            if (-not $dup) {
+                [void]$AppliedMap[$dem].Add([ordered]@{ commitText = $c.CommitText; commitId = $c.CommitId })
+            }
+        }
+    }
+
     Save-AppliedList -AppliedMap $AppliedMap -Path $AppliedFilePath
-    Write-Host ("已记录 {0} 条新合并提交到已合清单：$AppliedFilePath" -f $newly.Count) -ForegroundColor Green
-    return $newly.Count
+    Write-Host ("已记录 {0} 条新合并提交、{1} 条跳过提交到已合清单：$AppliedFilePath" -f $newly.Count, $skipNewly.Count) -ForegroundColor Green
+    return ($newly.Count + $skipNewly.Count)
 }
 
 function Assert-NoResidualCherryPick {
@@ -1203,6 +1236,7 @@ try {
 
         $pickArgs = @("cherry-pick") + $batchIds
         $pickResult = Invoke-Git -RepoPath $targetPath -Arguments $pickArgs -AllowFailure
+        $wasConflictPath = $false
         if ($pickResult.ExitCode -eq 0) {
             Write-Host "批量合并成功：$($batchIds.Count) 条提交。" -ForegroundColor Green
         }
@@ -1213,6 +1247,7 @@ try {
 
             if (-not [string]::IsNullOrWhiteSpace((Get-CherryPickInProgressCommit -RepoPath $targetPath))) {
                 # 冲突 / 空提交：进入冲突处理循环（基于 CHERRY_PICK_HEAD 动态状态，外部处理完成会自动退出）
+                $wasConflictPath = $true
                 $resolution = Resolve-CherryPickConflict -RepoPath $targetPath -PickOutput $pickResult.Output
             }
             else {
@@ -1236,6 +1271,27 @@ try {
                 }
                 default {
                     # Continued / External：由下一轮重新校验决定
+                }
+            }
+        }
+
+        # 冲突解决 / 批量成功后，把 sequencer 已经应用的本批提交显式记入已合集合，
+        # 不再依赖 git cherry 的 patch-id 比对。冲突解决后内容常与源提交不同，git cherry 会把它
+        # 判为"未合并"，导致下一轮重新校验又把它排进批次、再次 cherry-pick、再次冲突，陷入死循环。
+        # 仅当确实走过了 sequencer 应用（干净成功，或冲突路径且未中止/退出）时才标记。
+        if (($pickResult.ExitCode -eq 0) -or ($wasConflictPath -and (-not $stopRequested))) {
+            $stoppedNow = Get-CherryPickInProgressCommit -RepoPath $targetPath
+            if ([string]::IsNullOrWhiteSpace($stoppedNow)) {
+                # sequencer 已结束：整批评论都已应用
+                foreach ($bid in $batchIds) {
+                    if (-not $userSkippedIds.Contains($bid)) { [void]$allAppliedIds.Add($bid) }
+                }
+            }
+            else {
+                # sequencer 停在 $stoppedNow：其之前的提交都已应用
+                foreach ($bid in $batchIds) {
+                    if ($bid -eq $stoppedNow) { break }
+                    if (-not $userSkippedIds.Contains($bid)) { [void]$allAppliedIds.Add($bid) }
                 }
             }
         }

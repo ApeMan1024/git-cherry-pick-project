@@ -506,7 +506,7 @@ function Merge-Begin {
         return
     }
     if ($DemandNos.Count -eq 0) {
-        Add-Log '没有可合并的需求编号（列表为空）。' ([System.Drawing.Color]::Yellow)
+        Add-Log '没有可合并的需求编号（列表为空）。' ([System.Drawing.Color]::DarkGoldenrod)
         return
     }
 
@@ -545,20 +545,67 @@ function Merge-Begin {
         SkippedIds  = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         MergedIds   = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         RecordedIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        TrustAppliedIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         Pending     = New-Object System.Collections.ArrayList
         DidPick     = $false
+        CurrentBatchIds = @()
+        LastBatchApplied = $false
         SourceBranch = ''
         TargetBranch = ''
     }
 
     Merge-EnableDemandButtons $false
-    Add-Log "========== 开始合并项目 [$key] ==========" ([System.Drawing.Color]::Cyan)
+    Add-Log "========== 开始合并项目 [$key] ==========" ([System.Drawing.Color]::DarkCyan)
     Merge-Scan
+}
+
+function Select-AppliedListsGui {
+    # 启动合并前，若已存在"已合清单"，询问用户是否信任并加载（加载后这些提交将被跳过，不再重复合并）。
+    # 与命令行参考脚本 git-cherry-pick.ps1 的 Select-AppliedLists 行为一致。
+    $m = $script:merge
+    $m.TrustAppliedIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+
+    $hasList = $false
+    foreach ($dn in $m.DemandNos) {
+        if ($m.AppliedMap.ContainsKey($dn) -and $m.AppliedMap[$dn].Count -gt 0) { $hasList = $true; break }
+    }
+    if (-not $hasList) {
+        # 没有已合清单，直接进入确认环节（rev-list + git cherry 仍会排除已合提交）
+        Merge-Confirm; return
+    }
+
+    Add-Log '检测到以下需求存在已合清单：' ([System.Drawing.Color]::DarkCyan)
+    foreach ($dn in $m.DemandNos) {
+        if ($m.AppliedMap.ContainsKey($dn) -and $m.AppliedMap[$dn].Count -gt 0) {
+            Add-Log ("  需求 {0}：已记录 {1} 条" -f $dn, $m.AppliedMap[$dn].Count) ([System.Drawing.Color]::Gray)
+        }
+    }
+    Show-OperationPanel -Message '检测到以下需求存在已合清单（加载后这些提交将被跳过，不再重复合并）。是否加载？' -Options @(
+        @{Key='A'; Label='全部加载'},
+        @{Key='Q'; Label='不加载（按 rev-list + git cherry 判断）'}
+    ) -NextAction {
+        param($choice)
+        $m = $script:merge
+        # 重新计算，避免依赖已离开作用域的局部变量
+        $m.TrustAppliedIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        if ($choice -eq 'A') {
+            foreach ($dn in $m.DemandNos) {
+                if ($m.AppliedMap.ContainsKey($dn) -and $m.AppliedMap[$dn].Count -gt 0) {
+                    foreach ($c in $m.AppliedMap[$dn]) { [void]$m.TrustAppliedIds.Add($c.commitId) }
+                }
+            }
+            Add-Log '已加载已合清单，对应提交将被跳过。' ([System.Drawing.Color]::Green)
+        }
+        else {
+            Add-Log '未加载已合清单，将按 rev-list + git cherry 判断。' ([System.Drawing.Color]::DarkGoldenrod)
+        }
+        Merge-Confirm
+    }
 }
 
 function Merge-Scan {
     $m = $script:merge
-    Add-Log '检索源分支提交记录...' ([System.Drawing.Color]::Cyan)
+    Add-Log '检索源分支提交记录...' ([System.Drawing.Color]::DarkCyan)
     try {
         $m.SourceBranch = Get-CurrentBranchGui -RepoPath $m.Source
         $m.TargetBranch = Get-CurrentBranchGui -RepoPath $m.Target
@@ -612,16 +659,16 @@ function Merge-Scan {
     $m.AllCommits = @($allCommits | Where-Object { $selectedCommitIds.Contains($_.CommitId) })
 
     if ($m.AllCommits.Count -eq 0) {
-        Add-Log '所有需求均未检索到符合条件的提交，不执行合并。' ([System.Drawing.Color]::Yellow)
+        Add-Log '所有需求均未检索到符合条件的提交，不执行合并。' ([System.Drawing.Color]::DarkGoldenrod)
         Merge-Finish '未检索到可合并提交'; return
     }
 
     Add-Log ("共检索到 {0} 条待处理提交（按源分支时间从旧到新）。" -f $m.AllCommits.Count) ([System.Drawing.Color]::Gray)
-    Merge-Confirm
+    Select-AppliedListsGui
 }
 
 function Merge-Confirm {
-    Add-Log '请确认是否开始合并。' ([System.Drawing.Color]::Cyan)
+    Add-Log '请确认是否开始合并。' ([System.Drawing.Color]::DarkCyan)
     Show-OperationPanel -Message '确认开始合并？' -Options @(
         @{Key='A'; Label='开始合并'},
         @{Key='B'; Label='取消'}
@@ -640,7 +687,7 @@ function Merge-Precheck {
         return
     }
     $short = $head.Substring(0, [Math]::Min(12, $head.Length))
-    Add-Log "检测到目标仓库存在未完成的 cherry-pick 状态（CHERRY_PICK_HEAD = $short）。" ([System.Drawing.Color]::Yellow)
+    Add-Log "检测到目标仓库存在未完成的 cherry-pick 状态（CHERRY_PICK_HEAD = $short）。" ([System.Drawing.Color]::DarkGoldenrod)
     Show-OperationPanel -Message "目标仓库存在未完成的 cherry-pick（$short）。请选择处理方式：" -Options @(
         @{Key='A'; Label='中止残留 cherry-pick 并继续'},
         @{Key='C'; Label='我已手动处理完成，重新检测后继续'},
@@ -652,7 +699,7 @@ function Merge-Precheck {
         if ($choice -eq 'A') {
             $r = Invoke-GitGui -RepoPath $m.Target -Arguments @('cherry-pick','--abort')
             if ($r.ExitCode -ne 0) {
-                Add-Log "中止失败：$($r.Output)" ([System.Drawing.Color]::Yellow)
+                Add-Log "中止失败：$($r.Output)" ([System.Drawing.Color]::DarkGoldenrod)
                 Merge-Precheck; return
             }
             Add-Log '已中止残留 cherry-pick，目标分支恢复到合并前状态。' ([System.Drawing.Color]::Green)
@@ -664,7 +711,7 @@ function Merge-Precheck {
                 Add-Log '残留状态已清除，继续后续步骤。' ([System.Drawing.Color]::Green)
                 Merge-Pull; return
             }
-            Add-Log 'CHERRY_PICK_HEAD 仍存在，请先完成或中止 cherry-pick 后再继续。' ([System.Drawing.Color]::Yellow)
+            Add-Log 'CHERRY_PICK_HEAD 仍存在，请先完成或中止 cherry-pick 后再继续。' ([System.Drawing.Color]::DarkGoldenrod)
             Merge-Precheck; return
         }
     }
@@ -679,10 +726,10 @@ function Merge-Pull {
         Merge-Finish '合并中止（目标工作区不干净）'; return
     }
 
-    Add-Log '更新目标分支到最新状态（git pull）...' ([System.Drawing.Color]::Cyan)
+    Add-Log '更新目标分支到最新状态（git pull）...' ([System.Drawing.Color]::DarkCyan)
     $up = Invoke-GitGui -RepoPath $m.Target -Arguments @('rev-parse','--abbrev-ref','--symbolic-full-name','@{u}')
     if ($up.ExitCode -ne 0) {
-        Add-Log '目标分支未配置上游分支（@{u}），跳过更新。' ([System.Drawing.Color]::Yellow)
+        Add-Log '目标分支未配置上游分支（@{u}），跳过更新。' ([System.Drawing.Color]::DarkGoldenrod)
         Merge-Fetch; return
     }
     $pull = Invoke-GitGui -RepoPath $m.Target -Arguments @('-c','pull.rebase=false','pull')
@@ -690,7 +737,7 @@ function Merge-Pull {
         if (-not [string]::IsNullOrWhiteSpace($pull.Output)) { Add-Log $pull.Output ([System.Drawing.Color]::Gray) }
         Merge-Fetch; return
     }
-    Add-Log "git pull 执行失败：`n$($pull.Output)" ([System.Drawing.Color]::Yellow)
+    Add-Log "git pull 执行失败：`n$($pull.Output)" ([System.Drawing.Color]::DarkGoldenrod)
     Show-OperationPanel -Message 'git pull 失败，请在另一个终端处理（如解决冲突或检查网络）后继续。' -Options @(
         @{Key='Y'; Label='我已手动处理完成，确认继续'},
         @{Key='Q'; Label='退出'}
@@ -703,7 +750,7 @@ function Merge-Pull {
 
 function Merge-Fetch {
     $m = $script:merge
-    Add-Log '从本地源仓库抓取提交对象（不会修改源项目，也不会 push）...' ([System.Drawing.Color]::Cyan)
+    Add-Log '从本地源仓库抓取提交对象（不会修改源项目，也不会 push）...' ([System.Drawing.Color]::DarkCyan)
     $fetch = Invoke-GitGui -RepoPath $m.Target -Arguments @('fetch','--no-tags',$m.Source,$m.SourceBranch)
     if ($fetch.ExitCode -ne 0) {
         Add-Log "git fetch 失败：$($fetch.Output)" ([System.Drawing.Color]::Red)
@@ -715,13 +762,14 @@ function Merge-Fetch {
 
 function Merge-ReVerify {
     $m = $script:merge
-    Add-Log '当前正在校验内容是否已经合并....' ([System.Drawing.Color]::Cyan)
+    Add-Log '当前正在校验内容是否已经合并....' ([System.Drawing.Color]::DarkCyan)
     try {
         $targetHead = (Invoke-GitGui -RepoPath $m.Target -Arguments @('rev-parse','HEAD')).Output.Trim()
+        # 已合跟踪集合 = 用户选择信任的已合清单 + 本次运行过程中新记录的（含跳过的）
         $allApplied = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-        foreach ($dn in $m.AppliedMap.Keys) {
-            foreach ($c in $m.AppliedMap[$dn]) { [void]$allApplied.Add($c.commitId) }
-        }
+        foreach ($id in $m.TrustAppliedIds) { [void]$allApplied.Add($id) }
+        foreach ($id in $m.RecordedIds)     { [void]$allApplied.Add($id) }
+        foreach ($id in $m.MergedIds)       { [void]$allApplied.Add($id) }
         $unmerged = @(Get-UnmergedCommitsGui -RepoPath $m.Target -TargetHead $targetHead -Commits $m.AllCommits -AppliedCommitIds $allApplied)
     }
     catch {
@@ -759,6 +807,9 @@ function Merge-ReVerify {
         Add-Log ("已记录 {0} 条新合并提交到已合清单。" -f $newly.Count) ([System.Drawing.Color]::Green)
     }
 
+    # 把"被跳过"的提交也持久化进已合清单（统一走 Save-SkippedIdsGui，E 退出时也会复用）
+    Save-SkippedIdsGui
+
     # 计算待合并（排除已跳过/已合）
     $m.Pending = New-Object System.Collections.ArrayList
     foreach ($c in $unmerged) {
@@ -787,7 +838,9 @@ function Merge-PickBatch {
     $m = $script:merge
     if ($m.Pending.Count -eq 0) { Merge-ReVerify; return }
     $batchIds = @($m.Pending | Select-Object -First 100 | ForEach-Object { $_.CommitId })
-    Add-Log ("当前正在批量合并内容....（本批 {0} 条）" -f $batchIds.Count) ([System.Drawing.Color]::Cyan)
+    # 记录本批提交，供冲突解决后显式标记为已合并（见 Mark-BatchAppliedGui）
+    $m.CurrentBatchIds = $batchIds
+    Add-Log ("当前正在批量合并内容....（本批 {0} 条）" -f $batchIds.Count) ([System.Drawing.Color]::DarkCyan)
     foreach ($bid in $batchIds) { Add-Log ("  待合并 " + $bid.Substring(0, [Math]::Min(12, $bid.Length))) ([System.Drawing.Color]::Gray) }
 
     $args = @('cherry-pick') + $batchIds
@@ -798,7 +851,7 @@ function Merge-PickBatch {
         Merge-ReVerify
         return
     }
-    if (-not [string]::IsNullOrWhiteSpace($r.Output)) { Add-Log $r.Output ([System.Drawing.Color]::Yellow) }
+    if (-not [string]::IsNullOrWhiteSpace($r.Output)) { Add-Log $r.Output ([System.Drawing.Color]::DarkGoldenrod) }
 
     if (-not [string]::IsNullOrWhiteSpace((Get-CherryPickInProgressGui -RepoPath $m.Target))) {
         Merge-Conflict -PickOutput $r.Output
@@ -808,12 +861,75 @@ function Merge-PickBatch {
     }
 }
 
+function Mark-BatchAppliedGui {
+    # 冲突解决 / 批量成功后，把 sequencer 已应用的本批原始提交 id 显式记入"已合清单"并落盘。
+    # 关键修复：不再只依赖 git cherry 的 patch-id 比对——冲突解决后内容与源提交常不一致，
+    # git cherry 会把它判为"未合并"，导致下一轮重新校验又排进批次、再次 cherry-pick、再次冲突，陷入死循环。
+    param([string]$StoppedId)
+    $m = $script:merge
+    if ($null -eq $m.CurrentBatchIds -or $m.CurrentBatchIds.Count -eq 0) { return }
+    foreach ($bid in $m.CurrentBatchIds) {
+        # sequencer 停在 StoppedId：其之后的提交尚未应用，停止标记
+        if (-not [string]::IsNullOrWhiteSpace($StoppedId) -and ($bid -eq $StoppedId)) { break }
+        # 被用户跳过的提交不应记为已合并
+        if ($m.SkippedIds.Contains($bid)) { continue }
+        if ($m.MergedIds.Contains($bid)) { continue }
+        [void]$m.MergedIds.Add($bid)
+        $c = @($m.AllCommits | Where-Object { $_.CommitId -eq $bid }) | Select-Object -First 1
+        if ($null -ne $c) {
+            $demands = $m.CommitDemandMap[$bid]
+            if ($null -eq $demands) { $demands = @() }
+            foreach ($dem in $demands) {
+                if (-not $m.AppliedMap.ContainsKey($dem)) { $m.AppliedMap[$dem] = New-Object System.Collections.ArrayList }
+                $dup = $false
+                foreach ($ex in $m.AppliedMap[$dem]) {
+                    if ([string]::Equals($ex.commitId, $bid, [StringComparison]::OrdinalIgnoreCase)) { $dup = $true; break }
+                }
+                if (-not $dup) { [void]$m.AppliedMap[$dem].Add([ordered]@{ commitText = $c.CommitText; commitId = $bid }) }
+            }
+        }
+    }
+    Save-AppliedMap -AppliedFile $m.AppliedFile -Map $m.AppliedMap
+}
+
+function Save-SkippedIdsGui {
+    # 把"被跳过"的提交持久化进已合清单，避免下次运行因缺少记录而重复尝试同一提交，
+    # 陷入"冲突/空提交 -> 跳过 -> 不落盘 -> 再冲突"的死循环。
+    # 用于：(1) 每轮重新校验时（见 Merge-ReVerify）；(2) 用户按 E 保留现场并退出时——
+    # 此时序列仍在中途，若不打盘，跳过的提交下次重跑又会被当成未合并而再次冲突。
+    $m = $script:merge
+    if ($null -eq $m -or $null -eq $m.SkippedIds -or $m.SkippedIds.Count -eq 0) { return }
+    $skipNewly = New-Object System.Collections.ArrayList
+    foreach ($c in $m.AllCommits) {
+        $id = $c.CommitId
+        if (-not $m.SkippedIds.Contains($id)) { continue }
+        if ($m.RecordedIds.Contains($id)) { continue }
+        [void]$skipNewly.Add($c)
+    }
+    if ($skipNewly.Count -eq 0) { return }
+    foreach ($c in $skipNewly) {
+        [void]$m.RecordedIds.Add($c.CommitId)
+        $demands = $m.CommitDemandMap[$c.CommitId]
+        if ($null -eq $demands) { $demands = @() }
+        foreach ($dem in $demands) {
+            if (-not $m.AppliedMap.ContainsKey($dem)) { $m.AppliedMap[$dem] = New-Object System.Collections.ArrayList }
+            $dup = $false
+            foreach ($ex in $m.AppliedMap[$dem]) {
+                if ([string]::Equals($ex.commitId, $c.CommitId, [StringComparison]::OrdinalIgnoreCase)) { $dup = $true; break }
+            }
+            if (-not $dup) { [void]$m.AppliedMap[$dem].Add([ordered]@{ commitText = $c.CommitText; commitId = $c.CommitId }) }
+        }
+    }
+    Save-AppliedMap -AppliedFile $m.AppliedFile -Map $m.AppliedMap
+    Add-Log ("已记录 {0} 条跳过提交到已合清单（避免重复尝试）。" -f $skipNewly.Count) ([System.Drawing.Color]::Yellow)
+}
+
 function Merge-Conflict {
     param([string]$PickOutput)
     $m = $script:merge
     $currentId = Get-CherryPickInProgressGui -RepoPath $m.Target
     $short = $currentId.Substring(0, [Math]::Min(12, $currentId.Length))
-    Add-Log "提交 $short 发生冲突或产生空提交。" ([System.Drawing.Color]::Yellow)
+    Add-Log "提交 $short 发生冲突或产生空提交。" ([System.Drawing.Color]::DarkGoldenrod)
     Show-OperationPanel -Message "提交 $short 冲突/空提交。请在另一个终端解决冲突并执行 git add 后选择：" -Options @(
         @{Key='C'; Label='已处理，继续'},
         @{Key='S'; Label='跳过该提交'},
@@ -827,27 +943,31 @@ function Merge-Conflict {
             'C' {
                 $un = Invoke-GitGui -RepoPath $m.Target -Arguments @('diff','--name-only','--diff-filter=U')
                 if ($un.ExitCode -eq 0 -and (-not [string]::IsNullOrWhiteSpace($un.Output))) {
-                    Add-Log "仍存在未解决的冲突文件，请先处理并执行 git add 后再选 C：`n$($un.Output)" ([System.Drawing.Color]::Yellow)
+                    Add-Log "仍存在未解决的冲突文件，请先处理并执行 git add 后再选 C：`n$($un.Output)" ([System.Drawing.Color]::DarkGoldenrod)
                     Merge-Conflict -PickOutput ''; return
                 }
                 $cont = Invoke-GitGui -RepoPath $m.Target -Arguments @('-c','core.editor=true','cherry-pick','--continue')
                 if ($cont.ExitCode -ne 0) {
-                    Add-Log $cont.Output ([System.Drawing.Color]::Yellow)
+                    Add-Log $cont.Output ([System.Drawing.Color]::DarkGoldenrod)
                     $still = Get-CherryPickInProgressGui -RepoPath $m.Target
                     if (-not [string]::IsNullOrWhiteSpace($still)) {
                         # 区分空提交与仍有冲突，避免用户反复点 C 陷入死循环
                         $outLow = $cont.Output.ToLowerInvariant()
                         if ($outLow -match 'empty|空提交|nothing to commit|no changes') {
-                            Add-Log '当前提交为空提交（变更可能已在目标分支中）。请选 S 跳过该提交，或在另一个终端执行 "git commit --allow-empty" 后再点 C。' ([System.Drawing.Color]::Yellow)
+                            Add-Log '当前提交为空提交（变更可能已在目标分支中）。请选 S 跳过该提交，或在另一个终端执行 "git commit --allow-empty" 后再点 C。' ([System.Drawing.Color]::DarkGoldenrod)
                         }
                         else {
-                            Add-Log 'cherry-pick --continue 失败，可能仍存在冲突。请确认已执行 git add 后再试。' ([System.Drawing.Color]::Yellow)
+                            Add-Log 'cherry-pick --continue 失败，可能仍存在冲突。请确认已执行 git add 后再试。' ([System.Drawing.Color]::DarkGoldenrod)
                         }
                         Merge-Conflict -PickOutput $cont.Output; return
                     }
                     Merge-ReVerify; return
                 }
-                if ([string]::IsNullOrWhiteSpace((Get-CherryPickInProgressGui -RepoPath $m.Target))) {
+                $stopped = Get-CherryPickInProgressGui -RepoPath $m.Target
+                if ([string]::IsNullOrWhiteSpace($stopped)) {
+                    # 整批评论均已应用：显式标记为已合并并落盘，避免依赖 git cherry 的 patch-id 比对
+                    # （冲突解决后内容常与源提交不同，git cherry 会判定为"未合并"，从而反复重放同一提交）
+                    Mark-BatchAppliedGui -StoppedId ''
                     $resolvedId = if ([string]::IsNullOrWhiteSpace($id)) { '（外部已处理）' } else { $id.Substring(0,12) }
                     Add-Log "冲突已解决，提交 $resolvedId 合并完成。" ([System.Drawing.Color]::Green)
                     Merge-ReVerify; return
@@ -857,22 +977,28 @@ function Merge-Conflict {
             'S' {
                 $skip = Invoke-GitGui -RepoPath $m.Target -Arguments @('cherry-pick','--skip')
                 if ($skip.ExitCode -ne 0) {
-                    Add-Log $skip.Output ([System.Drawing.Color]::Yellow)
+                    Add-Log $skip.Output ([System.Drawing.Color]::DarkGoldenrod)
                     if ([string]::IsNullOrWhiteSpace((Get-CherryPickInProgressGui -RepoPath $m.Target))) { Merge-ReVerify; return }
                     Merge-Conflict -PickOutput ''; return
                 }
-                Add-Log "已跳过提交 $($id.Substring(0,12))。" ([System.Drawing.Color]::Yellow)
+                Add-Log "已跳过提交 $($id.Substring(0,12))。" ([System.Drawing.Color]::DarkGoldenrod)
                 [void]$m.SkippedIds.Add($id)
+                # --skip 后 sequencer 会自动继续；若停在下一处冲突应继续处理，而非直接重新校验
+                if (-not [string]::IsNullOrWhiteSpace((Get-CherryPickInProgressGui -RepoPath $m.Target))) {
+                    Merge-Conflict -PickOutput ''; return
+                }
                 Merge-ReVerify; return
             }
             'A' {
                 $ab = Invoke-GitGui -RepoPath $m.Target -Arguments @('cherry-pick','--abort')
                 if ($ab.ExitCode -ne 0) { Add-Log "中止失败：$($ab.Output)" ([System.Drawing.Color]::Red) }
-                else { Add-Log '已中止本轮 cherry-pick，并恢复到合并前状态。' ([System.Drawing.Color]::Yellow) }
+                else { Add-Log '已中止本轮 cherry-pick，并恢复到合并前状态。' ([System.Drawing.Color]::DarkGoldenrod) }
                 Merge-Finish '合并已中止'; return
             }
             'E' {
-                Add-Log '脚本已退出，冲突现场被保留。' ([System.Drawing.Color]::Yellow)
+                Add-Log '脚本已退出，冲突现场被保留。' ([System.Drawing.Color]::DarkGoldenrod)
+                # 序列仍可能中途进行：先把已跳过的提交落盘，避免下次重跑又冲突
+                Save-SkippedIdsGui
                 Merge-Finish '合并已退出（保留现场）'; return
             }
         }
@@ -885,7 +1011,7 @@ function Merge-MergeFail {
     $failedId = ''
     if ($PickOutput -match 'commit\s+([0-9a-f]{40,})\s+is a merge') { $failedId = $Matches[1] }
     if (-not [string]::IsNullOrWhiteSpace($failedId)) {
-        Add-Log "提交 $failedId 是合并提交（merge commit），直接 cherry-pick 需要指定 -m 参数。" ([System.Drawing.Color]::Yellow)
+        Add-Log "提交 $failedId 是合并提交（merge commit），直接 cherry-pick 需要指定 -m 参数。" ([System.Drawing.Color]::DarkGoldenrod)
         Show-OperationPanel -Message "提交 $failedId 为合并提交，请选择处理策略：" -Options @(
             @{Key='M'; Label='以 -m 1 合并该提交'},
             @{Key='S'; Label='跳过该提交'},
@@ -901,25 +1027,25 @@ function Merge-MergeFail {
                     [void]$m.MergedIds.Add($failedId)
                     Merge-ReVerify; return
                 }
-                Add-Log $retry.Output ([System.Drawing.Color]::Yellow)
+                Add-Log $retry.Output ([System.Drawing.Color]::DarkGoldenrod)
                 if (-not [string]::IsNullOrWhiteSpace((Get-CherryPickInProgressGui -RepoPath $m.Target))) {
                     Merge-Conflict -PickOutput $retry.Output; return
                 }
                 Merge-ReVerify; return
             }
             if ($choice -eq 'S') {
-                Add-Log "已跳过提交 $failedId。" ([System.Drawing.Color]::Yellow)
+                Add-Log "已跳过提交 $failedId。" ([System.Drawing.Color]::DarkGoldenrod)
                 [void]$m.SkippedIds.Add($failedId)
                 Merge-ReVerify; return
             }
             if ($choice -eq 'A') {
                 $ab = Invoke-GitGui -RepoPath $m.Target -Arguments @('cherry-pick','--abort')
                 if ($ab.ExitCode -ne 0) { Add-Log "中止失败：$($ab.Output)" ([System.Drawing.Color]::Red) }
-                else { Add-Log '已中止本轮 cherry-pick。' ([System.Drawing.Color]::Yellow) }
+                else { Add-Log '已中止本轮 cherry-pick。' ([System.Drawing.Color]::DarkGoldenrod) }
                 Merge-Finish '合并已中止'; return
             }
             if ($choice -eq 'E') {
-                Add-Log '脚本已退出，请检查目标仓库状态后手动处理。' ([System.Drawing.Color]::Yellow)
+                Add-Log '脚本已退出，请检查目标仓库状态后手动处理。' ([System.Drawing.Color]::DarkGoldenrod)
                 Merge-Finish '合并已退出'; return
             }
         }
@@ -933,11 +1059,11 @@ function Merge-MergeFail {
         ) -NextAction {
             param($choice)
             $m = $script:merge
-            if ($choice -eq 'C') { Add-Log '已确认，继续后续步骤。' ([System.Drawing.Color]::Yellow); Merge-ReVerify; return }
+            if ($choice -eq 'C') { Add-Log '已确认，继续后续步骤。' ([System.Drawing.Color]::DarkGoldenrod); Merge-ReVerify; return }
             if ($choice -eq 'S') {
                 if ($m.Pending.Count -gt 0) {
                     $sid = $m.Pending[0].CommitId
-                    Add-Log "已跳过提交 $($sid.Substring(0,12))。" ([System.Drawing.Color]::Yellow)
+                    Add-Log "已跳过提交 $($sid.Substring(0,12))。" ([System.Drawing.Color]::DarkGoldenrod)
                     [void]$m.SkippedIds.Add($sid)
                 }
                 Merge-ReVerify; return
@@ -945,17 +1071,17 @@ function Merge-MergeFail {
             if ($choice -eq 'A') {
                 $ab = Invoke-GitGui -RepoPath $m.Target -Arguments @('cherry-pick','--abort')
                 if ($ab.ExitCode -ne 0) { Add-Log "中止失败：$($ab.Output)" ([System.Drawing.Color]::Red) }
-                else { Add-Log '已中止本轮 cherry-pick。' ([System.Drawing.Color]::Yellow) }
+                else { Add-Log '已中止本轮 cherry-pick。' ([System.Drawing.Color]::DarkGoldenrod) }
                 Merge-Finish '合并已中止'; return
             }
-            if ($choice -eq 'E') { Add-Log '脚本已退出。' ([System.Drawing.Color]::Yellow); Merge-Finish '合并已退出'; return }
+            if ($choice -eq 'E') { Add-Log '脚本已退出。' ([System.Drawing.Color]::DarkGoldenrod); Merge-Finish '合并已退出'; return }
         }
     }
 }
 
 function Merge-PushPrompt {
     $m = $script:merge
-    Add-Log '内容合并已完成，是否执行 git push 推送？' ([System.Drawing.Color]::Cyan)
+    Add-Log '内容合并已完成，是否执行 git push 推送？' ([System.Drawing.Color]::DarkCyan)
     Show-OperationPanel -Message "是否执行 git push 推送（分支：$($m.TargetBranch)）？" -Options @(
         @{Key='A'; Label='执行 git push 推送'},
         @{Key='B'; Label='结束程序，不推送'}
@@ -963,14 +1089,14 @@ function Merge-PushPrompt {
         param($choice)
         $m = $script:merge
         if ($choice -eq 'B') {
-            Add-Log '程序结束，未执行 git push。请检查合并结果后自行推送。' ([System.Drawing.Color]::Yellow)
+            Add-Log '程序结束，未执行 git push。请检查合并结果后自行推送。' ([System.Drawing.Color]::DarkGoldenrod)
             Merge-Finish '合并完成（未推送）'; return
         }
         # 确定推送目标
         $up = Invoke-GitGui -RepoPath $m.Target -Arguments @('rev-parse','--abbrev-ref','--symbolic-full-name','@{u}')
         $pushArgs = @()
         if ($up.ExitCode -eq 0) {
-            Add-Log "检测到上游分支：$($up.Output.Trim())" ([System.Drawing.Color]::Cyan)
+            Add-Log "检测到上游分支：$($up.Output.Trim())" ([System.Drawing.Color]::DarkCyan)
         }
         else {
             $rems = Invoke-GitGui -RepoPath $m.Target -Arguments @('remote')
@@ -979,11 +1105,11 @@ function Merge-PushPrompt {
                 $remoteNames = @($rems.Output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
             }
             if ($remoteNames.Count -eq 0) {
-                Add-Log '目标仓库未配置任何远程仓库，无法执行 push。' ([System.Drawing.Color]::Yellow)
+                Add-Log '目标仓库未配置任何远程仓库，无法执行 push。' ([System.Drawing.Color]::DarkGoldenrod)
                 Merge-Finish '合并完成（无远程，未推送）'; return
             }
             $remoteName = $remoteNames[0]
-            Add-Log "目标分支未配置上游分支，将使用 $remoteName 做首次推送。" ([System.Drawing.Color]::Yellow)
+            Add-Log "目标分支未配置上游分支，将使用 $remoteName 做首次推送。" ([System.Drawing.Color]::DarkGoldenrod)
             $pushArgs = @('-u', $remoteName, $m.TargetBranch)
         }
         Merge-DoPush -PushArgs $pushArgs
@@ -993,29 +1119,29 @@ function Merge-PushPrompt {
 function Merge-DoPush {
     param([string[]]$PushArgs)
     $m = $script:merge
-    Add-Log ("正在执行 git push（分支：$($m.TargetBranch)）...") ([System.Drawing.Color]::Cyan)
+    Add-Log ("正在执行 git push（分支：$($m.TargetBranch)）...") ([System.Drawing.Color]::DarkCyan)
     $push = Invoke-GitGui -RepoPath $m.Target -Arguments (@('push') + $PushArgs)
     if ($push.ExitCode -eq 0) {
         if (-not [string]::IsNullOrWhiteSpace($push.Output)) { Add-Log $push.Output ([System.Drawing.Color]::Gray) }
         Add-Log "git push 成功，分支 $($m.TargetBranch) 已推送至远端。" ([System.Drawing.Color]::Green)
         Merge-Finish '合并完成并已推送'; return
     }
-    Add-Log $push.Output ([System.Drawing.Color]::Yellow)
-    Add-Log 'git push 执行失败。' ([System.Drawing.Color]::Yellow)
+    Add-Log $push.Output ([System.Drawing.Color]::DarkGoldenrod)
+    Add-Log 'git push 执行失败。' ([System.Drawing.Color]::DarkGoldenrod)
     Show-OperationPanel -Message 'git push 失败，请检查网络/凭据/远端状态后选择：' -Options @(
         @{Key='R'; Label='重试 push'},
         @{Key='B'; Label='结束程序，不推送'}
     ) -NextAction {
         param($choice)
         if ($choice -eq 'R') { Merge-DoPush -PushArgs $PushArgs; return }
-        Add-Log '程序结束，未执行 git push。' ([System.Drawing.Color]::Yellow)
+        Add-Log '程序结束，未执行 git push。' ([System.Drawing.Color]::DarkGoldenrod)
         Merge-Finish '合并完成（未推送）'
     }
 }
 
 function Merge-Finish {
     param([string]$Message)
-    Add-Log ("========== {0} ==========" -f $Message) ([System.Drawing.Color]::Cyan)
+    Add-Log ("========== {0} ==========" -f $Message) ([System.Drawing.Color]::DarkCyan)
     Hide-OperationPanel
     Merge-EnableDemandButtons $true
     # 刷新需求列表的"是否合并"状态
