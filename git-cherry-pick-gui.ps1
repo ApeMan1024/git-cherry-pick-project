@@ -1605,9 +1605,13 @@ function Build-MainForm {
     $form.Font = New-Object System.Drawing.Font('Microsoft YaHei', 9)
 
     # ---------- 顶部：全局操作按钮 ----------
+    # 注意：topPanel 必须在 mainSplit 之后 Add 到 Form。
+    # WinForms Dock 布局按 Controls 集合逆序处理；若先 Add topPanel 再 Add mainSplit(Fill)，
+    # mainSplit 会先占满整个客户区，导致其 Y=0、被 topPanel 覆盖，表现为左侧列表首行
+    # / 右侧 GroupBox 标题被按钮区遮挡。参考 more_tool_manager.ps1:237-261 的
+    # "完全手动 SetBounds" 思路，这里保留 SplitContainer 但修正 Dock 添加顺序。
     $topPanel = New-Object System.Windows.Forms.Panel
     $topPanel.Dock = 'Top'; $topPanel.Height = 50; $topPanel.BackColor = [System.Drawing.Color]::FromArgb(240,240,245)
-    $form.Controls.Add($topPanel)
 
     $btnAddProject = New-Object System.Windows.Forms.Button; $btnAddProject.Text = '新增项目'; $btnAddProject.Location = New-Object System.Drawing.Point(15,10); $btnAddProject.Size = New-Object System.Drawing.Size(110,30); $topPanel.Controls.Add($btnAddProject)
     $btnEditProject = New-Object System.Windows.Forms.Button; $btnEditProject.Text = '修改项目'; $btnEditProject.Location = New-Object System.Drawing.Point(140,10); $btnEditProject.Size = New-Object System.Drawing.Size(110,30); $topPanel.Controls.Add($btnEditProject)
@@ -1619,25 +1623,53 @@ function Build-MainForm {
     $mainSplit.Dock = 'Fill'
     $mainSplit.Orientation = 'Vertical'
     $form.Controls.Add($mainSplit)
-    $form.Controls.SetChildIndex($mainSplit, 1)
     # SplitterDistance 必须在 Add 到父容器之后设置：
     # 若先于 Add 设置，控件默认 Width=150，SplitterDistance=250 会被截断为 ~121；
     # 之后 Dock=Fill 触发 Layout 时 WinForms 会按比例重新分配 Panel，SplitterDistance 实际变成 ~874，
     # 导致 Panel1 占满、Panel2 极窄（界面错位的根因）。
     $mainSplit.SplitterDistance = 250
 
-    # 左侧：项目列表（使用 GroupBox 形成明确区块）
+    # 关键：topPanel 在 mainSplit 之后 Add，确保 Dock=Top 优先于 Dock=Fill 布局，
+    # 使 mainSplit 从 Y=50 开始而非覆盖整个客户区。
+    $form.Controls.Add($topPanel)
+    $form.Controls.SetChildIndex($topPanel, 1)
+
+    # 左侧：项目列表（参考 more_tool_manager.ps1:237-261 的布局方式）
+    # 教训：PS 5.1 WinForms 下 Dock=Fill 多层嵌套（SplitContainer→GroupBox→ListBox）
+    #       偶发失效，导致 ListBox 高度异常、首行被裁 / 首屏不渲染
+    #       （表现为 warehouse.json 第 1 个项目"消失"、GroupBox 标题被列表覆盖）。
+    #       弃用 GroupBox + Dock，改用 leftPanel 内手动 SetBounds + Layout 事件同步。
     $leftPanel = $mainSplit.Panel1
     $leftPanel.Padding = New-Object System.Windows.Forms.Padding(6)
     $leftPanel.BackColor = [System.Drawing.Color]::FromArgb(245,245,250)
-    $grpProjects = New-Object System.Windows.Forms.GroupBox
-    $grpProjects.Text = '项目列表（点击查看详情，可多选删除）'
-    $grpProjects.Dock = 'Fill'
-    $leftPanel.Controls.Add($grpProjects)
+
+    $lblProjects = New-Object System.Windows.Forms.Label
+    $lblProjects.Text = '项目列表（点击查看详情，可多选删除）'
+    $lblProjects.Font = New-Object System.Drawing.Font('Microsoft YaHei', 9)
+    $lblProjects.ForeColor = [System.Drawing.Color]::DimGray
+    $leftPanel.Controls.Add($lblProjects)
+
     $projectList = New-Object System.Windows.Forms.ListBox
-    $projectList.Dock = 'Fill'; $projectList.SelectionMode = 'MultiExtended'; $projectList.Font = New-Object System.Drawing.Font('Microsoft YaHei', 10)
+    $projectList.SelectionMode = 'MultiExtended'
+    $projectList.Font = New-Object System.Drawing.Font('Microsoft YaHei', 10)
+    # 参考 more_tool_manager.ps1:259-260：IntegralHeight=False 避免 ListBox
+    # 按整行高度自动取整导致首屏不绘制 / 首行被裁。
+    $projectList.IntegralHeight = $false
     $projectList.BorderStyle = 'FixedSingle'; $projectList.BackColor = [System.Drawing.Color]::White
-    $grpProjects.Controls.Add($projectList)
+    $leftPanel.Controls.Add($projectList)
+
+    # 手动布局同步（参考 more_tool_manager.ps1:328）：创建时立即执行一次，避免依赖
+    # Add_Layout 首次触发；同时挂接到 Layout 事件，在窗体缩放/拖动分隔条时保持同步。
+    $syncProjectList = {
+        $w = $leftPanel.ClientSize.Width
+        $h = $leftPanel.ClientSize.Height
+        if ($w -lt 10 -or $h -lt 10) { return }
+        $lblProjects.SetBounds(2, 2, $w - 4, 20)
+        # 标题下方留 8px 间距，防止 ListBox 首行与按钮区/标题区紧贴或被遮挡
+        $projectList.SetBounds(2, 30, $w - 4, $h - 34)
+    }.GetNewClosure()
+    & $syncProjectList
+    $leftPanel.Add_Layout($syncProjectList)
 
     # 右侧：再拆分为左右两栏（左栏需求，右栏执行；给执行区更大空间）
     $rightSplit = New-Object System.Windows.Forms.SplitContainer
@@ -1763,6 +1795,7 @@ function Build-MainForm {
 
     # 保存句柄
     $ui.ProjectList      = $projectList
+    $ui.SyncProjectList  = $syncProjectList
     $ui.ProjectInfoLabel = $projectInfoLabel
     $ui.DemandList       = $demandList
     $ui.LogBox           = $logBox
@@ -1793,8 +1826,28 @@ function Build-MainForm {
 
 Load-Warehouse
 $mainForm = [System.Windows.Forms.Form](Build-MainForm | Where-Object { $_ -is [System.Windows.Forms.Form] } | Select-Object -Last 1)
-Refresh-ProjectList
 $mainForm.Add_Shown({
+    # 参考 more_tool_manager（more_tool_manager.ps1:817-848）：
+    # WinForms 控件在窗体首次显示前可能未完成最终布局，此时填充 Dock=Fill 的
+    # ListBox 会出现首项/首屏不渲染的问题。将项目列表填充移到 Shown 事件
+    # （布局完成后）执行，并在消息泵空闲后再强制刷新一次兜底。
+    # 先强制同步一次左侧布局，确保 ListBox 在最终尺寸确定后再填充数据。
+    try { & $ui.SyncProjectList } catch { }
+    Refresh-ProjectList
+    try {
+        $ui.ProjectList.Refresh()
+        $ui.ProjectList.Update()
+    } catch { }
+    # 额外保险：延迟 50ms 后再次强制刷新（给 WinForms 消息泵时间完成布局）
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 50
+    $timer.Add_Tick({
+        $timer.Stop()
+        $timer.Dispose()
+        $ui.ProjectList.Refresh()
+        $ui.ProjectList.Update()
+    }.GetNewClosure())
+    $timer.Start()
     Add-Log '界面渲染完成，可以进行项目与需求管理。' ([System.Drawing.Color]::DarkGreen)
 })
 [System.Windows.Forms.Application]::Run($mainForm)
