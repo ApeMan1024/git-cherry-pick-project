@@ -36,6 +36,17 @@ $script:logBuffer       = New-Object System.Collections.ArrayList   # 元素：@
 $script:logBufferLimit  = 40        # 缓冲行数阈值，达到即刷新
 $script:logMaxChars     = 200000    # 日志框文本上限，超出后从头部丢弃一半，避免长期运行越来越卡
 
+# 「是否合并」三态标志：写在每个项目的需求编号文件（gitCommitText.json）条目的 isMerge 字段上。
+#   '0' 未合并   该需求需要合并（合并时会被扫描）
+#   '1' 已合并   该需求不需要再次合并
+#   '2' 无需合并 该需求没有任何提交记录可合并
+# 历史文件没有该字段，读取时得到 $null：首次加载项目时按"已合清单"迁移补齐（已合并记 1，其余记 0），
+# 之后以文件中的值为准（用户可通过"切换状态"修改）。新增代码禁止硬编码这三个中文字面量。
+$script:FlagUnmerged = '0'
+$script:FlagMerged   = '1'
+$script:FlagNoNeed   = '2'
+$script:FlagLabel    = @{ '0' = '未合并'; '1' = '已合并'; '2' = '无需合并' }
+
 # =========================================================================
 # 纯逻辑辅助函数（无 UI）
 # =========================================================================
@@ -104,6 +115,156 @@ function Format-UserPath {
         $v = $v.Substring(0, $v.Length - 1)
     }
     return $v
+}
+
+function Get-CommitRecordPathGui {
+    # 需求提交记录文件路径：<记录目录>\<安全项目名>_<安全需求编号>.json
+    # 统一在此拼接，避免各调用点重复实现（历史上曾有多处重复拼接）。
+    param(
+        [Parameter(Mandatory=$true)][string]$RecordDir,
+        [Parameter(Mandatory=$true)][string]$ProjectKey,
+        [Parameter(Mandatory=$true)][string]$DemandNo
+    )
+    $safeKey = Get-SafeFileNamePartGui -Value $ProjectKey
+    $safeDn  = Get-SafeFileNamePartGui -Value $DemandNo
+    return (Join-Path $RecordDir ("{0}_{1}.json" -f $safeKey, $safeDn))
+}
+
+function Test-DemandHasCommitsGui {
+    <#
+      判断需求是否"有提交记录"，用于区分「无需合并」与「未合并」：
+      记录文件不存在 / commitRecordList 为空 / 文件损坏 一律视为没有提交记录。
+      纯本地文件读取，绝不触发 git 调用——刷新需求列表是高频操作，必须保持零 git 进程。
+      返回 @{HasCommits; Count}
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$RecordDir,
+        [Parameter(Mandatory=$true)][string]$ProjectKey,
+        [Parameter(Mandatory=$true)][string]$DemandNo
+    )
+    $count = 0
+    $path = Get-CommitRecordPathGui -RecordDir $RecordDir -ProjectKey $ProjectKey -DemandNo $DemandNo
+    if (Test-Path -LiteralPath $path -PathType Leaf) {
+        try {
+            $rec = Read-JsonFile -Path $path -Description '提交记录'
+            if (@($rec.PSObject.Properties.Name) -contains 'commitRecordList') {
+                foreach ($c in @($rec.commitRecordList)) {
+                    if ($null -eq $c) { continue }
+                    if (-not [string]::IsNullOrWhiteSpace([string]$c.commitId)) { $count++ }
+                }
+            }
+        }
+        catch { $count = 0 }
+    }
+    return [PSCustomObject]@{ HasCommits = ($count -gt 0); Count = $count }
+}
+
+function Read-DemandListFile {
+    <#
+      读取需求编号文件（gitCommitText.json）。条目结构：{ commitText; isMerge }
+      兼容：文件不存在（返回空列表）、单对象 / 数组两种历史写法、缺少 isMerge 字段。
+      isMerge 字段缺失时返回 $null，由调用方决定是否迁移（见 Refresh-DemandList）。
+      文件损坏时按 Read-JsonFile 的约定抛错，由调用方决定提示方式。
+    #>
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $list = New-Object System.Collections.ArrayList
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $list }
+    foreach ($e in @(Read-JsonFile -Path $Path -Description '需求编号文件 gitCommitText.json')) {
+        if ($null -eq $e -or $null -eq $e.commitText) { continue }
+        $t = ([string]$e.commitText).Trim()
+        if ([string]::IsNullOrWhiteSpace($t)) { continue }
+        $flag = $null
+        if (@($e.PSObject.Properties.Name) -contains 'isMerge') {
+            $v = ([string]$e.isMerge).Trim()
+            if ($script:FlagLabel.ContainsKey($v)) { $flag = $v }
+        }
+        [void]$list.Add([ordered]@{ commitText = $t; isMerge = $flag })
+    }
+    # 注意：必须用 ,$list 输出。直接 return $list 会被管道展开——只有一个需求编号时
+    # 调用方拿到的是那个 [ordered] 字典本身（.Count 变成字段数 2，遍历变成遍历键名）。
+    return ,$list
+}
+
+function Save-DemandListFile {
+    # 写回需求编号文件：每个条目固定写出 commitText + isMerge（isMerge 非法/缺失时按「未合并」= 0 写出）
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)]$Entries
+    )
+    $arr = New-Object System.Collections.ArrayList
+    foreach ($e in $Entries) {
+        $flag = ([string]$e.isMerge).Trim()
+        if (-not $script:FlagLabel.ContainsKey($flag)) { $flag = $script:FlagUnmerged }
+        $o = New-Object PSObject
+        $o | Add-Member -MemberType NoteProperty -Name 'commitText' -Value ([string]$e.commitText)
+        $o | Add-Member -MemberType NoteProperty -Name 'isMerge'    -Value $flag
+        [void]$arr.Add($o)
+    }
+    Write-JsonFile -Path $Path -Object $arr
+}
+
+function Get-DemandFlagGui {
+    <#
+      需求当前应有的 isMerge：
+        ① 该需求没有任何提交记录              -> 2（无需合并）
+        ② 有提交记录且已合清单中有该需求的记录 -> 1（已合并）
+        ③ 其余                                -> 0（未合并）
+      仅读本地文件（提交记录文件 + 已合清单），不触发 git 调用。
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$RecordDir,
+        [Parameter(Mandatory=$true)][string]$ProjectKey,
+        [Parameter(Mandatory=$true)][string]$DemandNo,
+        [hashtable]$AppliedMap
+    )
+    if (-not (Test-DemandHasCommitsGui -RecordDir $RecordDir -ProjectKey $ProjectKey -DemandNo $DemandNo).HasCommits) {
+        return $script:FlagNoNeed
+    }
+    if (($null -ne $AppliedMap) -and $AppliedMap.ContainsKey($DemandNo) -and $AppliedMap[$DemandNo].Count -gt 0) {
+        return $script:FlagMerged
+    }
+    return $script:FlagUnmerged
+}
+
+function Get-DemandMigrateFlagGui {
+    <#
+      历史需求缺少 isMerge 字段时的迁移值：
+        已合清单中已有该需求的记录 -> 1（已合并），其余 -> 0（未合并）。
+      这里刻意不判「无需合并」：尚未扫描过的需求不能仅因为缺少提交记录文件就被判为无需合并，
+      否则它永远不会被"全部合并"扫描到（"无需合并"只在真正执行过扫描后写入）。
+    #>
+    param(
+        [Parameter(Mandatory=$true)][hashtable]$AppliedMap,
+        [Parameter(Mandatory=$true)][string]$DemandNo
+    )
+    if ($AppliedMap.ContainsKey($DemandNo) -and $AppliedMap[$DemandNo].Count -gt 0) {
+        return $script:FlagMerged
+    }
+    return $script:FlagUnmerged
+}
+
+function Update-DemandFlagsGui {
+    <#
+      把 isMerge 批量写回需求编号文件。Flags：需求编号 -> 标志（大小写不敏感）。
+      只在确有变化时写盘，返回实际修改的条目数。
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$DemandFile,
+        [Parameter(Mandatory=$true)][hashtable]$Flags
+    )
+    if ($Flags.Count -eq 0) { return 0 }
+    $entries = Read-DemandListFile -Path $DemandFile   # 不要再套 @()，见 Refresh-DemandList 注释
+    if ($entries.Count -eq 0) { return 0 }
+    $changed = 0
+    foreach ($e in $entries) {
+        if (-not $Flags.ContainsKey($e.commitText)) { continue }
+        $want = [string]$Flags[$e.commitText]
+        if ([string]::Equals([string]$e.isMerge, $want, [StringComparison]::Ordinal)) { continue }
+        $e.isMerge = $want
+        $changed++
+    }
+    if ($changed -gt 0) { Save-DemandListFile -Path $DemandFile -Entries $entries }
+    return $changed
 }
 
 function Load-Warehouse {
@@ -622,19 +783,38 @@ function Refresh-DemandList {
     $seq = 0
     if (Test-Path -LiteralPath $paths.DemandFile -PathType Leaf) {
         try {
-            $arr = @(Read-JsonFile -Path $paths.DemandFile -Description "需求配置文件（项目 $key）")
-            foreach ($e in $arr) {
-                if ($null -eq $e -or $null -eq $e.commitText) { continue }
-                $dn = ([string]$e.commitText).Trim()
-                if ([string]::IsNullOrWhiteSpace($dn)) { continue }
-                $seq++
-                $merged = '未合并'
-                if ($script:appliedMap.ContainsKey($dn) -and $script:appliedMap[$dn].Count -gt 0) {
-                    $merged = '已合并'
+            # 注意：Read-DemandListFile 用 ",$list" 返回 ArrayList，这里不能再套 @()，
+            # 否则会得到「只含一个 ArrayList 元素的数组」，遍历/Count 全部错位。
+            $entries = Read-DemandListFile -Path $paths.DemandFile
+
+            # 迁移（优化版本7 需求 3）：历史需求没有 isMerge 字段时补齐——已合并记 1，其余记 0。
+            # 先按迁移值规范化内存数据，再尽力写盘；写盘失败不影响列表显示。
+            $migrate = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($e in $entries) {
+                if ($null -ne $e.isMerge) { continue }
+                $e.isMerge = Get-DemandMigrateFlagGui -AppliedMap $script:appliedMap -DemandNo $e.commitText
+                $migrate[$e.commitText] = $e.isMerge
+            }
+            if ($migrate.Count -gt 0) {
+                try {
+                    $changed = Update-DemandFlagsGui -DemandFile $paths.DemandFile -Flags $migrate
+                    if ($changed -gt 0) {
+                        Add-LogNow ("已为 {0} 条历史需求补充 isMerge 字段（已合并记 1，其余记 0）。" -f $changed) ([System.Drawing.Color]::Gray)
+                    }
                 }
+                catch {
+                    Add-LogNow "写入 isMerge 字段失败：$($_.Exception.Message)" ([System.Drawing.Color]::Red)
+                }
+            }
+
+            foreach ($e in $entries) {
+                $flag = ([string]$e.isMerge).Trim()
+                if (-not $script:FlagLabel.ContainsKey($flag)) { $flag = $script:FlagUnmerged }
+                $seq++
                 $item = New-Object System.Windows.Forms.ListViewItem ($seq.ToString())
-                [void]$item.SubItems.Add($dn)
-                [void]$item.SubItems.Add($merged)
+                [void]$item.SubItems.Add($e.commitText)
+                [void]$item.SubItems.Add($script:FlagLabel[$flag])
+                $item.Tag = $flag   # 供"合并选中/切换状态"判断，避免比较显示文本
                 [void]$list.Items.Add($item)
             }
             if ($list.Items.Count -gt 0) {
@@ -815,11 +995,17 @@ function Merge-Begin {
         TrustAppliedIds = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
         Pending     = New-Object System.Collections.ArrayList
         PendingPool = $null        # P1-1：上次校验得出的"未合并"集合，供增量校验做集合差
-        DidPick     = $false
+        # 用户在"合并失败且未进入可继续状态"时选了「我已手动处理完成」——此时他可能已在外部
+        # 终端自行 cherry-pick 出提交。判断"是否需要询问 push"时要把它算作"本次有过合入动作"。
+        # 真正的合入计数以 MergedIds 为准（只有确实应用成功的提交才进入该集合）。
+        ExternalHandled = $false
         CurrentBatchIds = @()
         LastBatchApplied = $false
         SourceBranch = ''
         TargetBranch = ''
+        # 是否已完成一次完整的提交记录扫描（Merge-Scan 写完记录文件后置为 $true）。
+        # 未完成扫描时不能回写 isMerge：否则会把"尚未扫描、没有记录文件"的需求误判成「无需合并」。
+        Scanned     = $false
     }
 
     $script:mergeBusy = $true
@@ -890,7 +1076,6 @@ function Merge-Scan {
     if (-not (Test-Path -LiteralPath $m.RecordDir -PathType Container)) {
         [void](New-Item -ItemType Directory -Path $m.RecordDir -Force)
     }
-    $safeKey = Get-SafeFileNamePartGui -Value $m.Key
 
     # P1-2 改造：一次遍历扫出所有需求编号的命中情况。
     # 旧实现是"每个需求各扫一遍全量提交"（O(需求数 × 提交数) 次正则匹配）。
@@ -905,14 +1090,13 @@ function Merge-Scan {
         $u = $d.ToUpperInvariant()
         $matches = @()
         if ($matchMap.ContainsKey($u)) { $matches = @($matchMap[$u]) }
-        $safeDn  = Get-SafeFileNamePartGui -Value $d
         $record  = [ordered]@{
             demandNo = $dn
             commitRecordList = @($matches | ForEach-Object {
                 [ordered]@{ commitText = $_.CommitText; commitId = $_.CommitId; commitTime = $_.CommitTime }
             })
         }
-        $recordPath = Join-Path $m.RecordDir ("{0}_{1}.json" -f $safeKey, $safeDn)
+        $recordPath = Get-CommitRecordPathGui -RecordDir $m.RecordDir -ProjectKey $m.Key -DemandNo $dn
         Write-JsonFile -Path $recordPath -Object $record
         Add-Log ("需求 {0}：找到 {1} 条提交，记录已写入 {2}" -f $dn, $matches.Count, $recordPath) ([System.Drawing.Color]::Gray)
 
@@ -927,6 +1111,8 @@ function Merge-Scan {
             [void]$selectedCommitIds.Add($c.CommitId)
         }
     }
+    # 记录文件已按本次扫描结果全部写盘，此后 Merge-Finish 才允许回写 isMerge
+    $m.Scanned = $true
 
     # 对齐命令行脚本的合并策略：先汇总所有需求命中的提交，再按源分支原始提交时间
     # （$allCommits 由 git log --reverse 取得，严格从旧到新）统一排序，而不是按需求编号
@@ -1140,14 +1326,22 @@ function Merge-ReVerify {
     }
 
     if ($m.Pending.Count -eq 0) {
-        if ($m.DidPick) {
+        # 本次是否真的往目标分支合入过提交 —— 决定要不要询问 git push：
+        #   MergedIds 只累积"确实已应用成功"的提交（批量成功 / 冲突解决后 --continue 成功 /
+        #   -m 1 重试成功），被用户跳过的提交（SkippedIds）不计入；
+        #   ExternalHandled 覆盖"用户在外部终端手动处理完成"的情况。
+        # 一条都没合入（选中提交此前已合并、或全部被跳过）时不再询问推送 ——
+        # 没有可推送的合并结果，多问一次只会让用户困惑。
+        $mergedSomething = ($m.MergedIds.Count -gt 0) -or $m.ExternalHandled
+        if ($mergedSomething) {
             Add-Log '所有选中提交已合并完成。' ([System.Drawing.Color]::Green)
+            Merge-PushPrompt
         }
         else {
-            Add-Log '所有选中提交均已合并过，无需执行 cherry-pick。' ([System.Drawing.Color]::Green)
+            Add-LogNow '所有选中提交均已合并过或已跳过，无需执行 cherry-pick。' ([System.Drawing.Color]::Green)
+            Add-LogNow '本次没有合入任何提交，无内容可推送，跳过 git push 询问。' ([System.Drawing.Color]::Gray)
+            Merge-Finish '合并结束（无需 cherry-pick）'
         }
-        # 无论本次是否实际执行过 cherry-pick，合并流程结束后都询问是否推送
-        Merge-PushPrompt
         return
     }
 
@@ -1171,7 +1365,8 @@ function Merge-PickBatch {
     $r = Invoke-GitGui -RepoPath $m.Target -Arguments $args
     if ($r.ExitCode -eq 0) {
         Add-Log ("批量合并成功：$($batchIds.Count) 条提交。") ([System.Drawing.Color]::Green)
-        $m.DidPick = $true
+        # 本批提交随即进入 MergedIds（见 Mark-BatchAppliedGui）——"本次是否合入过提交、
+        # 要不要询问 git push"就是以 MergedIds 为准，不再单独维护"是否 pick 过"的标志。
         # P1-1：退出码 0 表示本批全部应用，直接落盘已合清单；随后的校验因此可走增量路径（零 git 进程）
         Mark-BatchAppliedGui -StoppedId ''
         Merge-ReVerify -Incremental
@@ -1387,7 +1582,13 @@ function Merge-MergeFail {
         ) -NextAction {
             param($choice)
             $m = $script:merge
-            if ($choice -eq 'C') { Add-Log '已确认，继续后续步骤。' ([System.Drawing.Color]::DarkGoldenrod); Merge-ReVerify; return }
+            if ($choice -eq 'C') {
+                Add-Log '已确认，继续后续步骤。' ([System.Drawing.Color]::DarkGoldenrod)
+                # 用户可能在外部终端自行完成了 cherry-pick，可能已在目标分支产生提交；
+                # 置位后即使本次工具没有合入任何提交，也仍会询问是否 push。
+                $m.ExternalHandled = $true
+                Merge-ReVerify; return
+            }
             if ($choice -eq 'S') {
                 if ($m.Pending.Count -gt 0) {
                     $sid = $m.Pending[0].CommitId
@@ -1469,6 +1670,7 @@ function Merge-DoPush {
 
 function Merge-Finish {
     param([string]$Message)
+    $m = $script:merge
     Add-Log ("========== {0} ==========" -f $Message) ([System.Drawing.Color]::DarkCyan)
     Flush-Log
     Hide-OperationPanel
@@ -1478,6 +1680,24 @@ function Merge-Finish {
     if (-not [string]::IsNullOrWhiteSpace($script:currentProject)) {
         $paths = Get-ProjectPaths -Key $script:currentProject
         Load-AppliedMap -AppliedFile $paths.AppliedFile
+        # 优化版本7 需求 4/5：本次执行过的需求，按扫描结果与已合清单回写 isMerge
+        #   完全没有提交记录 -> 2（无需合并）；已合清单中有记录 -> 1（已合并）；其余 -> 0（未合并）
+        # 记录文件已由 Merge-Scan 按最新扫描结果重写，因此这里的判定是"本次扫描后"的真实状态。
+        if (($null -ne $m) -and $m.Scanned -and ($null -ne $m.DemandNos) -and ($m.DemandNos.Count -gt 0)) {
+            try {
+                $flags = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
+                foreach ($dn in $m.DemandNos) {
+                    $flags[$dn] = Get-DemandFlagGui -RecordDir $m.RecordDir -ProjectKey $m.Key -DemandNo $dn -AppliedMap $script:appliedMap
+                }
+                $changed = Update-DemandFlagsGui -DemandFile $paths.DemandFile -Flags $flags
+                if ($changed -gt 0) {
+                    Add-LogNow ("已更新 {0} 条需求的 isMerge 字段（1=已合并 / 2=无需合并 / 0=未合并）。" -f $changed) ([System.Drawing.Color]::Gray)
+                }
+            }
+            catch {
+                Add-LogNow "更新 isMerge 字段失败：$($_.Exception.Message)" ([System.Drawing.Color]::Red)
+            }
+        }
         Refresh-DemandList
     }
     $script:merge = $null
@@ -1708,11 +1928,12 @@ function Demand-OverwriteAdd {
     $arr = New-Object System.Collections.ArrayList
     $dup = 0
     foreach ($d in $input) {
-        if ($seen.Add($d)) { $o = New-Object PSObject; $o | Add-Member -MemberType NoteProperty -Name 'commitText' -Value $d; [void]$arr.Add($o) }
+        # 新增的需求统一为「未合并」（优化版本7 需求 2）
+        if ($seen.Add($d)) { [void]$arr.Add([ordered]@{ commitText = $d; isMerge = $script:FlagUnmerged }) }
         else { $dup++ }
     }
-    Write-JsonFile -Path $paths.DemandFile -Object $arr
-    Add-LogNow ("已覆盖写入 {0} 条需求编号（忽略重复 {1} 条）到 {2}" -f $arr.Count, $dup, $paths.DemandFile) ([System.Drawing.Color]::Green)
+    Save-DemandListFile -Path $paths.DemandFile -Entries $arr
+    Add-LogNow ("已覆盖写入 {0} 条需求编号（忽略重复 {1} 条），isMerge 统一置为「未合并」。" -f $arr.Count, $dup) ([System.Drawing.Color]::Green)
     Refresh-DemandList
 }
 
@@ -1726,24 +1947,21 @@ function Demand-PlainAdd {
 
     $existing = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $arr = New-Object System.Collections.ArrayList
-    if (Test-Path -LiteralPath $paths.DemandFile -PathType Leaf) {
-        foreach ($e in @(Read-JsonFile -Path $paths.DemandFile -Description '需求文件')) {
-            if ($null -eq $e -or $null -eq $e.commitText) { continue }
-            $t = ([string]$e.commitText).Trim()
-            if ([string]::IsNullOrWhiteSpace($t)) { continue }
-            [void]$existing.Add($t)
-            $o = New-Object PSObject; $o | Add-Member -MemberType NoteProperty -Name 'commitText' -Value $t; [void]$arr.Add($o)
-        }
+    # 保留原有需求编号及其 isMerge 状态（单纯新增不得丢掉历史状态）
+    foreach ($e in (Read-DemandListFile -Path $paths.DemandFile)) {
+        [void]$existing.Add($e.commitText)
+        [void]$arr.Add([ordered]@{ commitText = $e.commitText; isMerge = $e.isMerge })
     }
     $added = 0; $skipped = 0
     foreach ($d in $input) {
         if ($existing.Contains($d)) { $skipped++; continue }
         [void]$existing.Add($d)
-        $o = New-Object PSObject; $o | Add-Member -MemberType NoteProperty -Name 'commitText' -Value $d; [void]$arr.Add($o)
+        # 新增的需求统一为「未合并」（优化版本7 需求 2）
+        [void]$arr.Add([ordered]@{ commitText = $d; isMerge = $script:FlagUnmerged })
         $added++
     }
-    Write-JsonFile -Path $paths.DemandFile -Object $arr
-    Add-LogNow ("已新增 {0} 条需求编号，已存在跳过 {1} 条。" -f $added, $skipped) ([System.Drawing.Color]::Green)
+    Save-DemandListFile -Path $paths.DemandFile -Entries $arr
+    Add-LogNow ("已新增 {0} 条需求编号（isMerge 置为「未合并」），已存在跳过 {1} 条。" -f $added, $skipped) ([System.Drawing.Color]::Green)
     Refresh-DemandList
 }
 
@@ -1760,15 +1978,12 @@ function Demand-Delete {
 
     $paths = Get-ProjectPaths -Key $key
     $arr = New-Object System.Collections.ArrayList
-    if (Test-Path -LiteralPath $paths.DemandFile -PathType Leaf) {
-        foreach ($e in @(Read-JsonFile -Path $paths.DemandFile -Description '需求文件')) {
-            if ($null -eq $e -or $null -eq $e.commitText) { continue }
-            $t = ([string]$e.commitText).Trim()
-            if ($toRemove.Contains($t)) { continue }
-            $o = New-Object PSObject; $o | Add-Member -MemberType NoteProperty -Name 'commitText' -Value $t; [void]$arr.Add($o)
-        }
+    # 保留未被删除的需求编号及其 isMerge 状态
+    foreach ($e in (Read-DemandListFile -Path $paths.DemandFile)) {
+        if ($toRemove.Contains($e.commitText)) { continue }
+        [void]$arr.Add([ordered]@{ commitText = $e.commitText; isMerge = $e.isMerge })
     }
-    Write-JsonFile -Path $paths.DemandFile -Object $arr
+    Save-DemandListFile -Path $paths.DemandFile -Entries $arr
     Add-LogNow ("已删除 {0} 条需求编号。" -f $toRemove.Count) ([System.Drawing.Color]::Green)
     Refresh-DemandList
 }
@@ -1780,59 +1995,105 @@ function Demand-ToggleStatus {
     if ($sel.Count -ne 1) { [System.Windows.Forms.MessageBox]::Show('请选中一个需求编号进行状态切换。','提示','OK','Information'); return }
     $dn = $sel[0].SubItems[1].Text
     $current = $sel[0].SubItems[2].Text
+    $currentFlag = ([string]$sel[0].Tag).Trim()
+    if (-not $script:FlagLabel.ContainsKey($currentFlag)) { $currentFlag = $script:FlagUnmerged }
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "切换合并状态 - $dn"
-    $form.Size = New-Object System.Drawing.Size(320, 180)
+    $form.Size = New-Object System.Drawing.Size(400, 230)
     $form.StartPosition = 'CenterParent'; $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false; $form.MinimizeBox = $false
 
     $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = "当前状态：$current`n将该需求标记为："
-    $lbl.Location = New-Object System.Drawing.Point(15,15); $lbl.Size = New-Object System.Drawing.Size(280,40)
+    $lbl.Text = "当前状态：$current`n将该需求（isMerge 字段）标记为："
+    $lbl.Location = New-Object System.Drawing.Point(15,12); $lbl.Size = New-Object System.Drawing.Size(360,40)
     $form.Controls.Add($lbl)
 
-    $rbMerged = New-Object System.Windows.Forms.RadioButton; $rbMerged.Text = '已合并'; $rbMerged.Location = New-Object System.Drawing.Point(20,65); $rbMerged.Size = New-Object System.Drawing.Size(120,20); $form.Controls.Add($rbMerged)
-    $rbUnmerged = New-Object System.Windows.Forms.RadioButton; $rbUnmerged.Text = '未合并'; $rbUnmerged.Location = New-Object System.Drawing.Point(150,65); $rbUnmerged.Size = New-Object System.Drawing.Size(120,20); $form.Controls.Add($rbUnmerged)
-    if ($current -eq '已合并') { $rbMerged.Checked = $true } else { $rbUnmerged.Checked = $true }
+    # 三态：未合并(0) / 已合并(1) / 无需合并(2)
+    $rbUnmerged = New-Object System.Windows.Forms.RadioButton
+    $rbUnmerged.Text = '未合并（还需要合并，下次会重新扫描提交记录）'
+    $rbUnmerged.Location = New-Object System.Drawing.Point(20,58); $rbUnmerged.Size = New-Object System.Drawing.Size(350,20)
+    $form.Controls.Add($rbUnmerged)
 
-    $btnOk = New-Object System.Windows.Forms.Button; $btnOk.Text = '确定'; $btnOk.Location = New-Object System.Drawing.Point(125,110); $btnOk.Size = New-Object System.Drawing.Size(80,28); $form.Controls.Add($btnOk)
-    $btnCancel = New-Object System.Windows.Forms.Button; $btnCancel.Text = '取消'; $btnCancel.Location = New-Object System.Drawing.Point(215,110); $btnCancel.Size = New-Object System.Drawing.Size(80,28); $form.Controls.Add($btnCancel)
+    $rbMerged = New-Object System.Windows.Forms.RadioButton
+    $rbMerged.Text = '已合并（不再合并该需求）'
+    $rbMerged.Location = New-Object System.Drawing.Point(20,84); $rbMerged.Size = New-Object System.Drawing.Size(350,20)
+    $form.Controls.Add($rbMerged)
+
+    $rbNoNeed = New-Object System.Windows.Forms.RadioButton
+    $rbNoNeed.Text = '无需合并（该需求没有任何提交记录）'
+    $rbNoNeed.Location = New-Object System.Drawing.Point(20,110); $rbNoNeed.Size = New-Object System.Drawing.Size(350,20)
+    $form.Controls.Add($rbNoNeed)
+
+    if ($currentFlag -eq $script:FlagMerged)     { $rbMerged.Checked = $true }
+    elseif ($currentFlag -eq $script:FlagNoNeed) { $rbNoNeed.Checked = $true }
+    else                                        { $rbUnmerged.Checked = $true }
+
+    $btnOk = New-Object System.Windows.Forms.Button; $btnOk.Text = '确定'; $btnOk.Location = New-Object System.Drawing.Point(200,155); $btnOk.Size = New-Object System.Drawing.Size(80,28); $form.Controls.Add($btnOk)
+    $btnCancel = New-Object System.Windows.Forms.Button; $btnCancel.Text = '取消'; $btnCancel.Location = New-Object System.Drawing.Point(290,155); $btnCancel.Size = New-Object System.Drawing.Size(80,28); $form.Controls.Add($btnCancel)
     $btnCancel.Add_Click({ $form.DialogResult = 'Cancel'; $form.Close() })
     $btnOk.Add_Click({ $form.DialogResult = 'OK'; $form.Close() })
 
     if ($form.ShowDialog() -ne 'OK') { return }
-    $target = if ($rbMerged.Checked) { '已合并' } else { '未合并' }
-    if ($target -eq $current) { return }
+    $target = $script:FlagUnmerged
+    if ($rbMerged.Checked)     { $target = $script:FlagMerged }
+    elseif ($rbNoNeed.Checked) { $target = $script:FlagNoNeed }
+    if ($target -eq $currentFlag) { return }
+    $targetText = $script:FlagLabel[$target]
 
-    $r2 = [System.Windows.Forms.MessageBox]::Show("确认将需求 [$dn] 的状态切换为 [$target]？", '二次确认 - 切换状态', 'YesNo', 'Warning')
+    $hint = ''
+    if ($target -eq $script:FlagUnmerged) {
+        $hint = "`n`n下次合并该需求时会重新扫描提交记录，确认是否还有未合并的提交。`n已合清单中的历史提交记录会保留，不会重复合并。"
+    }
+    $r2 = [System.Windows.Forms.MessageBox]::Show("确认将需求 [$dn] 的状态切换为 [$targetText]？$hint", '二次确认 - 切换状态', 'YesNo', 'Warning')
     if ($r2 -ne 'Yes') { return }
 
     $paths = Get-ProjectPaths -Key $key
     Load-AppliedMap -AppliedFile $paths.AppliedFile
-    if ($target -eq '已合并') {
+    if ($target -eq $script:FlagMerged) {
         # 依赖已有的提交记录文件（扫描/合并生成）来获取 commitId
-        $safeDn = Get-SafeFileNamePartGui -Value $dn
-        $recPath = Join-Path $paths.RecordDir ("{0}_{1}.json" -f (Get-SafeFileNamePartGui -Value $key), $safeDn)
+        $recPath = Get-CommitRecordPathGui -RecordDir $paths.RecordDir -ProjectKey $key -DemandNo $dn
         if (-not (Test-Path -LiteralPath $recPath -PathType Leaf)) {
             [System.Windows.Forms.MessageBox]::Show("该需求暂无提交记录文件，无法标记已合并。请先执行扫描或合并以生成记录。", '无法标记', 'OK', 'Warning')
             return
         }
         $rec = Read-JsonFile -Path $recPath -Description '提交记录'
         if (-not $script:appliedMap.ContainsKey($dn)) { $script:appliedMap[$dn] = New-Object System.Collections.ArrayList }
+        $addedIds = 0
         foreach ($c in $rec.commitRecordList) {
             $cid = [string]$c.commitId
             if ([string]::IsNullOrWhiteSpace($cid)) { continue }
             $dup = $false
             foreach ($ex in $script:appliedMap[$dn]) { if ([string]::Equals($ex.commitId, $cid, [StringComparison]::OrdinalIgnoreCase)) { $dup = $true; break } }
-            if (-not $dup) { [void]$script:appliedMap[$dn].Add([ordered]@{ commitText = [string]$c.commitText; commitId = $cid }) }
+            if (-not $dup) { [void]$script:appliedMap[$dn].Add([ordered]@{ commitText = [string]$c.commitText; commitId = $cid }); $addedIds++ }
+        }
+        if ($addedIds -gt 0) { Save-AppliedMap -AppliedFile $paths.AppliedFile -Map $script:appliedMap }
+    }
+    elseif ($target -eq $script:FlagUnmerged) {
+        # 切回「未合并」只改 isMerge 字段，刻意**不清空**该需求的已合清单记录。
+        #
+        # 原因（2026-09-20 与用户确认）：常见场景是"需求此前已经合并过，之后又追加了新提交"，
+        # 此时把需求切回未合并只是为了补合那条新提交；早前的提交确实已经在目标分支里，
+        # 再次合并时必须继续跳过它们。若清空已合记录，这些历史提交会重新进入候选，
+        # 而冲突解决过的提交因 patch-id 与源提交不一致会被 git cherry 判为"未合并"
+        # 从而被反复重放（参见 Merge-Confirm 中的同类说明）。
+        # 出口：若确需重放历史提交，在合并流程的"是否加载已合清单"选择框里选"不加载"即可。
+        Add-LogNow ("需求 [{0}] 的已合清单记录已保留，下次合并仍会跳过历史已合提交，只处理新增提交。" -f $dn) ([System.Drawing.Color]::Gray)
+    }
+
+    # 回写 isMerge 字段（优化版本7 需求 1/5）
+    $flags = New-Object 'System.Collections.Hashtable' ([StringComparer]::OrdinalIgnoreCase)
+    $flags[$dn] = $target
+    try {
+        $changed = Update-DemandFlagsGui -DemandFile $paths.DemandFile -Flags $flags
+        if ($changed -eq 0) {
+            Add-LogNow ("需求 [{0}] 的 isMerge 未发生变化（可能该编号不在需求文件中）。" -f $dn) ([System.Drawing.Color]::DarkGoldenrod)
         }
     }
-    else {
-        if ($script:appliedMap.ContainsKey($dn)) { $script:appliedMap.Remove($dn) }
+    catch {
+        Add-LogNow "写入 isMerge 字段失败：$($_.Exception.Message)" ([System.Drawing.Color]::Red)
     }
-    Save-AppliedMap -AppliedFile $paths.AppliedFile -Map $script:appliedMap
-    Add-LogNow ("需求 [$dn] 状态已切换为 [$target]。") ([System.Drawing.Color]::Green)
+    Add-LogNow ("需求 [{0}] 状态已切换为 [{1}]（isMerge={2}）。" -f $dn, $targetText, $target) ([System.Drawing.Color]::Green)
     Refresh-DemandList
 }
 
@@ -1843,8 +2104,7 @@ function Demand-View {
     if ($sel.Count -ne 1) { [System.Windows.Forms.MessageBox]::Show('请选中一个需求编号查看提交记录。','提示','OK','Information'); return }
     $dn = $sel[0].SubItems[1].Text
     $paths = Get-ProjectPaths -Key $key
-    $safeDn = Get-SafeFileNamePartGui -Value $dn
-    $recPath = Join-Path $paths.RecordDir ("{0}_{1}.json" -f (Get-SafeFileNamePartGui -Value $key), $safeDn)
+    $recPath = Get-CommitRecordPathGui -RecordDir $paths.RecordDir -ProjectKey $key -DemandNo $dn
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "提交记录 - $dn"
@@ -1895,33 +2155,57 @@ function Demand-MergeAll {
     if (-not (Test-Path -LiteralPath $paths.DemandFile -PathType Leaf)) {
         [System.Windows.Forms.MessageBox]::Show('该项目暂无需求编号文件。','提示','OK','Information'); return
     }
-    $all = @()
-    foreach ($e in @(Read-JsonFile -Path $paths.DemandFile -Description '需求文件')) {
-        if ($null -eq $e -or $null -eq $e.commitText) { continue }
-        $t = ([string]$e.commitText).Trim()
-        if (-not [string]::IsNullOrWhiteSpace($t)) { $all += $t }
+    $entries = New-Object System.Collections.ArrayList
+    try {
+        $entries = Read-DemandListFile -Path $paths.DemandFile   # 不要再套 @()，见 Refresh-DemandList 注释
     }
-    if ($all.Count -eq 0) {
+    catch {
+        [System.Windows.Forms.MessageBox]::Show("读取需求编号文件失败：`n$($_.Exception.Message)", '读取失败', 'OK', 'Warning'); return
+    }
+    if ($entries.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show('列表中不存在需求编号，无法合并。','提示','OK','Information'); return
     }
-    # 若所有需求都已合并（applied 清单中存在），不允许再次合并
-    Load-AppliedMap -AppliedFile $paths.AppliedFile
-    $unmergedDemands = @($all | Where-Object { -not ($script:appliedMap.ContainsKey($_) -and $script:appliedMap[$_].Count -gt 0) })
-    if ($unmergedDemands.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show('需求已全部合并完成，不允许再次合并。','提示','OK','Information'); return
+
+    # 只合并「未合并(0)」的需求：
+    #   「已合并(1)」不需要再次合并；「无需合并(2)」没有提交记录可合并。
+    # 需要重新合并时，先用"切换状态"把需求改回「未合并」，届时会重新扫描提交记录（优化版本7 需求 5）。
+    $todo = New-Object System.Collections.ArrayList
+    $skipped = 0
+    foreach ($e in $entries) {
+        $flag = ([string]$e.isMerge).Trim()
+        if ([string]::IsNullOrWhiteSpace($flag) -or ($flag -eq $script:FlagUnmerged)) { [void]$todo.Add($e.commitText) }
+        else { $skipped++ }
     }
-    Merge-Begin -DemandNos $unmergedDemands
+    if ($todo.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('需求已全部合并或无需合并，不允许再次合并。','提示','OK','Information'); return
+    }
+    if ($skipped -gt 0) {
+        Add-LogNow ("全部合并：已跳过 {0} 条不属于「未合并」的需求。" -f $skipped) ([System.Drawing.Color]::DarkGoldenrod)
+    }
+    Merge-Begin -DemandNos $todo
 }
 
 function Demand-MergeSelected {
     $key = $script:currentProject
     if ([string]::IsNullOrWhiteSpace($key)) { return }
     $sel = @($ui.DemandList.SelectedItems)
-    $unmerged = @($sel | Where-Object { $_.SubItems[2].Text -ne '已合并' } | ForEach-Object { $_.SubItems[1].Text })
-    if ($unmerged.Count -eq 0) {
-        [System.Windows.Forms.MessageBox]::Show('请选择未合并的需求编号进行合并。','提示','OK','Information'); return
+    if ($sel.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('请选择需求编号进行合并。','提示','OK','Information'); return
     }
-    Merge-Begin -DemandNos $unmerged
+    $todo = New-Object System.Collections.ArrayList
+    $skipped = 0
+    foreach ($it in $sel) {
+        $flag = ([string]$it.Tag).Trim()
+        if ([string]::IsNullOrWhiteSpace($flag) -or ($flag -eq $script:FlagUnmerged)) { [void]$todo.Add($it.SubItems[1].Text) }
+        else { $skipped++ }
+    }
+    if ($todo.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('请选择「未合并」的需求编号进行合并（已合并/无需合并的需求会被跳过）。','提示','OK','Information'); return
+    }
+    if ($skipped -gt 0) {
+        Add-LogNow ("合并选中：已跳过 {0} 条不属于「未合并」的需求。" -f $skipped) ([System.Drawing.Color]::DarkGoldenrod)
+    }
+    Merge-Begin -DemandNos $todo
 }
 
 # =========================================================================

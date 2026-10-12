@@ -1,8 +1,10 @@
 [
   {
-    "commitText": "REQ-1001"
+    "commitText": "REQ-1001",
+    "isMerge": "0"
   },
   {
-    "commitText": "REQ-1002"
+    "commitText": "REQ-1002",
+    "isMerge": "1"
   }
 ]
