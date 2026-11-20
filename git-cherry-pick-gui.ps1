@@ -22,6 +22,12 @@ $script:warehouse       = @{}          # 项目名称 -> 配置对象
 $script:projectOrder    = New-Object System.Collections.ArrayList   # 保持 warehouse.json 书写顺序
 $script:currentProject  = $null        # 当前选中的项目
 $script:appliedMap      = @{}          # 当前项目的已合清单：demandNo -> ArrayList(@{commitText,commitId})
+# 需求列表静态过滤（优化版本8 追加）：
+#   demandAllItems 保存当前项目全量行（ListViewItem），列表只显示检索命中的子集；
+#   检索框为空时恢复全量显示。suppressDemandFilter 用于程序化清空检索框时
+#   暂停 TextChanged 触发的过滤，避免把上一个项目的旧行重新填进列表。
+$script:demandAllItems       = $null
+$script:suppressDemandFilter = $false
 # 合并引擎运行态
 $script:merge           = $null
 $script:opNext          = $null        # 当前操作面板"确定"后要执行的延续脚本块
@@ -265,6 +271,67 @@ function Update-DemandFlagsGui {
     }
     if ($changed -gt 0) { Save-DemandListFile -Path $DemandFile -Entries $entries }
     return $changed
+}
+
+function Build-PlainAddEntriesGui {
+    <#
+      优化版本8 需求 1：单纯新增时，本次录入的需求统一排到需求列表最前面；
+      其中"已存在被跳过"的需求保留其原 isMerge 状态并同样移动到最前，
+      未被本次录入涉及的历史条目按原顺序跟在后面。
+      纯逻辑函数（无 UI、无文件访问），便于隔离验证。
+      参数：
+        Entries  - 现有条目（Read-DemandListFile 的输出，元素为 ordered@{commitText;isMerge}）
+        InputNos - 本次录入的需求编号（按输入顺序，可含空白行/重复行）
+      返回 [PSCustomObject]@{ Entries = 最终条目序列(ArrayList); Added; Skipped }
+        Added   = 本次真正新增的条数（isMerge 置为「未合并」）
+        Skipped = 输入中命中"已存在"的次数（含输入内部重复，保留原 isMerge 并置顶）
+      说明：
+        - 匹配忽略大小写；置顶的已存在条目沿用文件中的原文与原状态，不因输入写法改变。
+        - 若文件里同一编号存在多条（历史异常数据），置顶后只保留第一条，其余同编号条目不再重复出现。
+    #>
+    param(
+        [AllowEmptyCollection()]$Entries,
+        [AllowEmptyCollection()][string[]]$InputNos
+    )
+    $origIndex = @{}   # 大写编号 -> 原条目（同编号多条时取第一条）
+    foreach ($e in $Entries) {
+        if ($null -eq $e) { continue }
+        $u = ([string]$e.commitText).Trim().ToUpperInvariant()
+        if ([string]::IsNullOrWhiteSpace($u)) { continue }
+        if (-not $origIndex.ContainsKey($u)) { $origIndex[$u] = $e }
+    }
+
+    $front   = New-Object System.Collections.ArrayList
+    $seen    = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $added   = 0
+    $skipped = 0
+    foreach ($d in $InputNos) {
+        $dn = ([string]$d).Trim()
+        if ([string]::IsNullOrWhiteSpace($dn)) { continue }
+        if (-not $seen.Add($dn)) { $skipped++; continue }   # 输入内部重复
+        $u = $dn.ToUpperInvariant()
+        if ($origIndex.ContainsKey($u)) {
+            # 已存在：保留原编号原文与原 isMerge，移动到最前
+            [void]$front.Add([ordered]@{ commitText = [string]$origIndex[$u].commitText; isMerge = $origIndex[$u].isMerge })
+            $skipped++
+        }
+        else {
+            # 新增的需求统一为「未合并」（优化版本7 需求 2）
+            [void]$front.Add([ordered]@{ commitText = $dn; isMerge = $script:FlagUnmerged })
+            $added++
+        }
+    }
+
+    $arr = New-Object System.Collections.ArrayList
+    foreach ($e in $front) { [void]$arr.Add($e) }
+    foreach ($e in $Entries) {
+        if ($null -eq $e) { continue }
+        $u = ([string]$e.commitText).Trim().ToUpperInvariant()
+        if ([string]::IsNullOrWhiteSpace($u)) { continue }
+        if ($seen.Contains($u)) { continue }   # 本次已置顶的条目不再重复出现在后面
+        [void]$arr.Add([ordered]@{ commitText = [string]$e.commitText; isMerge = $e.isMerge })
+    }
+    return [PSCustomObject]@{ Entries = $arr; Added = $added; Skipped = $skipped }
 }
 
 function Load-Warehouse {
@@ -764,11 +831,60 @@ function Refresh-ProjectList {
     }
 }
 
+function Clear-DemandSearch {
+    # 清空检索框并复位过滤数据。程序化清空时挂起 TextChanged 触发的过滤，
+    # 避免把上一个项目的 demandAllItems 重新填进已清空的列表。
+    if ($null -ne $ui.TxtSearchDemand -and $ui.TxtSearchDemand.Text -ne '') {
+        $script:suppressDemandFilter = $true
+        try { $ui.TxtSearchDemand.Text = '' } finally { $script:suppressDemandFilter = $false }
+    }
+    $script:demandAllItems = New-Object System.Collections.ArrayList
+}
+
+function Apply-DemandFilter {
+    # 静态过滤：列表只显示检索命中的需求编号（包含匹配、忽略大小写、支持多关键字）；
+    # 检索框为空时恢复全量显示。命中行沿用全量列表中的序号（反映文件中的真实位置）。
+    if ($script:suppressDemandFilter) { return }
+    $list = $ui.DemandList
+    if ($null -eq $list) { return }
+    $all = $script:demandAllItems
+    if ($null -eq $all) {
+        $all = New-Object System.Collections.ArrayList
+        $script:demandAllItems = $all
+    }
+    $kw = ''
+    if ($null -ne $ui.TxtSearchDemand) { $kw = ([string]$ui.TxtSearchDemand.Text).Trim() }
+    $tokens = @($kw -split '[\s,;，；]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+
+    $list.BeginUpdate()
+    try {
+        $list.Items.Clear()
+        foreach ($it in $all) {
+            if ($tokens.Count -eq 0) { [void]$list.Items.Add($it); continue }
+            $dn = [string]$it.SubItems[1].Text
+            foreach ($t in $tokens) {
+                if ($dn.IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                    [void]$list.Items.Add($it)
+                    break
+                }
+            }
+        }
+        # 过滤后默认选中第一条可见项，保证"复制/删除/切换状态"等依赖选中项的操作可用
+        if ($list.Items.Count -gt 0) {
+            $list.Items[0].Selected = $true
+            $list.EnsureVisible(0)
+        }
+    }
+    finally { $list.EndUpdate() }
+    $list.Refresh()
+}
+
 function Refresh-DemandList {
     $key = $script:currentProject
     $list = $ui.DemandList
     if ($null -eq $list) { return }
     $list.Items.Clear()
+    $script:demandAllItems = New-Object System.Collections.ArrayList
     if ([string]::IsNullOrWhiteSpace($key)) { return }
 
     # 强制 Details 视图与列（某些情况下 View 可能被重置导致行不显示）
@@ -815,12 +931,10 @@ function Refresh-DemandList {
                 [void]$item.SubItems.Add($e.commitText)
                 [void]$item.SubItems.Add($script:FlagLabel[$flag])
                 $item.Tag = $flag   # 供"合并选中/切换状态"判断，避免比较显示文本
-                [void]$list.Items.Add($item)
+                [void]$script:demandAllItems.Add($item)
             }
-            if ($list.Items.Count -gt 0) {
-                $list.Items[0].Selected = $true
-                $list.EnsureVisible(0)
-            }
+            # 静态过滤显示（检索框为空时即全量显示），并选中第一条可见项
+            Apply-DemandFilter
             # 强制重绘，避免 TableLayoutPanel 初次布局后 ListView 行不渲染
             $list.Refresh()
             $list.Update()
@@ -839,6 +953,8 @@ function Select-Project {
     param([string]$Key)
     # 合并进行中且会泵 UI 消息，禁止切换项目，避免改动 $script:appliedMap 等共享状态
     if ($script:mergeBusy) { return }
+    # 优化版本8 追加：切换项目（含切回原项目/取消选择）时清空检索框，列表全量显示
+    Clear-DemandSearch
     $script:currentProject = $Key
     if ([string]::IsNullOrWhiteSpace($Key)) {
         $ui.ProjectInfoLabel.Text = '未选择项目'
@@ -871,9 +987,11 @@ function Select-Project {
 function Set-DemandButtonsEnabled {
     param([bool]$Enabled)
     foreach ($b in @($ui.BtnOverwriteAdd, $ui.BtnAddDemand, $ui.BtnDelDemand,
-                     $ui.BtnToggleStatus, $ui.BtnView, $ui.BtnMergeAll, $ui.BtnMerge)) {
+                     $ui.BtnToggleStatus, $ui.BtnView, $ui.BtnCopyDemand, $ui.BtnSearchDemand,
+                     $ui.BtnMergeAll, $ui.BtnMerge)) {
         if ($null -ne $b) { $b.Enabled = $Enabled }
     }
+    if ($null -ne $ui.TxtSearchDemand) { $ui.TxtSearchDemand.Enabled = $Enabled }
 }
 
 # =========================================================================
@@ -933,9 +1051,11 @@ function Show-OperationPanel {
 
 function Merge-EnableDemandButtons($Enabled) {
     foreach ($b in @($ui.BtnOverwriteAdd, $ui.BtnAddDemand, $ui.BtnDelDemand,
-                     $ui.BtnToggleStatus, $ui.BtnView, $ui.BtnMergeAll, $ui.BtnMerge)) {
+                     $ui.BtnToggleStatus, $ui.BtnView, $ui.BtnCopyDemand, $ui.BtnSearchDemand,
+                     $ui.BtnMergeAll, $ui.BtnMerge)) {
         $b.Enabled = $Enabled
     }
+    if ($null -ne $ui.TxtSearchDemand) { $ui.TxtSearchDemand.Enabled = $Enabled }
     $ui.BtnDeleteProject.Enabled = $Enabled
     $ui.BtnEditProject.Enabled   = $Enabled
     $ui.BtnAddProject.Enabled    = $Enabled
@@ -1711,11 +1831,35 @@ function Show-ProjectForm {
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = if ($EditKey) { "修改项目 - $EditKey" } else { '新增项目' }
-    $form.Size = New-Object System.Drawing.Size(560, 380)
+    # 优化版本8 需求 4：地址输入框右侧要放"选择..."按钮，表单加宽
+    $form.Size = New-Object System.Drawing.Size(660, 380)
     $form.StartPosition = 'CenterParent'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
+
+    # 文件夹选择：选中后回填指定输入框；已填且存在的地址作为对话框初始目录。
+    # 输入框保持可编辑，手动输入与选择两种方式都支持。
+    function Pick-FolderInto {
+        param($TargetBox, [string]$DialogTitle)
+        $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+        $fbd.Description = $DialogTitle
+        $init = Format-UserPath $TargetBox.Text
+        if (-not [string]::IsNullOrWhiteSpace($init)) {
+            try {
+                if (Test-Path -LiteralPath $init -PathType Container) { $fbd.SelectedPath = $init }
+            } catch { }
+        }
+        $owner = $TargetBox.FindForm()
+        $chosen = $false
+        if ($null -ne $owner) {
+            $chosen = ($fbd.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK)
+        }
+        else {
+            $chosen = ($fbd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK)
+        }
+        if ($chosen) { $TargetBox.Text = $fbd.SelectedPath }
+    }
 
     $y = 20
     $labelW = 200; $textW = 300; $x1 = 20; $x2 = 230
@@ -1726,10 +1870,14 @@ function Show-ProjectForm {
     $y += 36
     $lblBefore = New-Object System.Windows.Forms.Label; $lblBefore.Text = '合并前项目地址（必填）'; $lblBefore.Location = New-Object System.Drawing.Point($x1,$y); $lblBefore.Size = New-Object System.Drawing.Size($labelW,20); $form.Controls.Add($lblBefore)
     $txtBefore = New-Object System.Windows.Forms.TextBox; $txtBefore.Location = New-Object System.Drawing.Point($x2,$y); $txtBefore.Size = New-Object System.Drawing.Size($textW,20); $form.Controls.Add($txtBefore)
+    $btnPickBefore = New-Object System.Windows.Forms.Button; $btnPickBefore.Text = '选择...'; $btnPickBefore.Location = New-Object System.Drawing.Point(($x2+$textW+8),$y); $btnPickBefore.Size = New-Object System.Drawing.Size(80,23); $form.Controls.Add($btnPickBefore)
+    $btnPickBefore.Add_Click({ Pick-FolderInto $txtBefore '请选择合并前项目地址（文件夹）' })
 
     $y += 36
     $lblBack = New-Object System.Windows.Forms.Label; $lblBack.Text = '合并后项目地址（必填）'; $lblBack.Location = New-Object System.Drawing.Point($x1,$y); $lblBack.Size = New-Object System.Drawing.Size($labelW,20); $form.Controls.Add($lblBack)
     $txtBack = New-Object System.Windows.Forms.TextBox; $txtBack.Location = New-Object System.Drawing.Point($x2,$y); $txtBack.Size = New-Object System.Drawing.Size($textW,20); $form.Controls.Add($txtBack)
+    $btnPickBack = New-Object System.Windows.Forms.Button; $btnPickBack.Text = '选择...'; $btnPickBack.Location = New-Object System.Drawing.Point(($x2+$textW+8),$y); $btnPickBack.Size = New-Object System.Drawing.Size(80,23); $form.Controls.Add($btnPickBack)
+    $btnPickBack.Add_Click({ Pick-FolderInto $txtBack '请选择合并后项目地址（文件夹）' })
 
     $y += 36
     $lblRec = New-Object System.Windows.Forms.Label; $lblRec.Text = '提交记录文件存放位置（可选）'; $lblRec.Location = New-Object System.Drawing.Point($x1,$y); $lblRec.Size = New-Object System.Drawing.Size($labelW,32); $form.Controls.Add($lblRec)
@@ -1938,30 +2086,25 @@ function Demand-OverwriteAdd {
 }
 
 function Demand-PlainAdd {
-    # 单纯新增：向 gitCommitText.json 追加（已存在的不再录入）
+    # 单纯新增（优化版本8 需求 1）：本次录入的需求统一排到列表最前面——
+    # 包括新增的需求（isMerge 置为「未合并」）与已存在被跳过的需求（保留原 isMerge）；
+    # 未被本次录入涉及的历史条目顺序不变，跟在后面。
     $key = $script:currentProject
     if ([string]::IsNullOrWhiteSpace($key)) { [System.Windows.Forms.MessageBox]::Show('请先选择项目。','提示','OK','Information'); return }
     $paths = Get-ProjectPaths -Key $key
     $input = Show-DemandInputDialog -Title '新增需求编号'
     if ($null -eq $input) { return }
 
-    $existing = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    $arr = New-Object System.Collections.ArrayList
-    # 保留原有需求编号及其 isMerge 状态（单纯新增不得丢掉历史状态）
-    foreach ($e in (Read-DemandListFile -Path $paths.DemandFile)) {
-        [void]$existing.Add($e.commitText)
-        [void]$arr.Add([ordered]@{ commitText = $e.commitText; isMerge = $e.isMerge })
+    try {
+        $existing = Read-DemandListFile -Path $paths.DemandFile
     }
-    $added = 0; $skipped = 0
-    foreach ($d in $input) {
-        if ($existing.Contains($d)) { $skipped++; continue }
-        [void]$existing.Add($d)
-        # 新增的需求统一为「未合并」（优化版本7 需求 2）
-        [void]$arr.Add([ordered]@{ commitText = $d; isMerge = $script:FlagUnmerged })
-        $added++
+    catch {
+        Add-LogNow "读取需求文件失败：$($_.Exception.Message)" ([System.Drawing.Color]::Red)
+        return
     }
-    Save-DemandListFile -Path $paths.DemandFile -Entries $arr
-    Add-LogNow ("已新增 {0} 条需求编号（isMerge 置为「未合并」），已存在跳过 {1} 条。" -f $added, $skipped) ([System.Drawing.Color]::Green)
+    $result = Build-PlainAddEntriesGui -Entries $existing -InputNos $input
+    Save-DemandListFile -Path $paths.DemandFile -Entries $result.Entries
+    Add-LogNow ("已新增 {0} 条需求编号（置顶，isMerge 置为「未合并」）；已存在并移至最前 {1} 条（保留原状态）。" -f $result.Added, $result.Skipped) ([System.Drawing.Color]::Green)
     Refresh-DemandList
 }
 
@@ -2148,6 +2291,63 @@ function Demand-View {
     [void]$form.ShowDialog()
 }
 
+function Demand-Search {
+    # 优化版本8 追加需求：静态过滤式检索 ——
+    #   检索时列表只显示命中的需求编号；检索框为空时恢复全量显示；
+    #   切换项目（含切回）会自动清空检索框并全量显示。
+    # 输入框 TextChanged 已实时过滤，此处为"检索"按钮/回车触发的统一入口并输出日志。
+    if ($script:mergeBusy) { return }
+    if ([string]::IsNullOrWhiteSpace($script:currentProject)) {
+        [System.Windows.Forms.MessageBox]::Show('请先选择项目。','提示','OK','Information'); return
+    }
+    $kw = ([string]$ui.TxtSearchDemand.Text).Trim()
+    $total = 0
+    if ($null -ne $script:demandAllItems) { $total = $script:demandAllItems.Count }
+    if ([string]::IsNullOrWhiteSpace($kw)) {
+        Apply-DemandFilter
+        Add-LogNow ("检索为空，已恢复全量显示（共 {0} 条）。" -f $total) ([System.Drawing.Color]::Gray)
+        return
+    }
+    Apply-DemandFilter
+    $shown = $ui.DemandList.Items.Count
+    if ($shown -gt 0) {
+        Add-LogNow ("检索 [{0}]：命中 {1} 条（全量 {2} 条），列表已过滤显示；清空检索框恢复全量。" -f $kw, $shown, $total) ([System.Drawing.Color]::Green)
+    }
+    else {
+        Add-LogNow ("检索 [{0}]：无匹配需求（该需求尚未添加）。清空检索框可恢复全量显示。" -f $kw) ([System.Drawing.Color]::DarkGoldenrod)
+    }
+}
+
+function Demand-Copy {
+    # 优化版本8 需求 3：把选中的一条或多条需求编号复制到剪贴板（每行一个，
+    # 与"新增"输入框的批量录入格式一致，可直接粘贴）。
+    if ($script:mergeBusy) { return }
+    if ([string]::IsNullOrWhiteSpace($script:currentProject)) {
+        [System.Windows.Forms.MessageBox]::Show('请先选择项目。','提示','OK','Information'); return
+    }
+    $sel = @($ui.DemandList.SelectedItems)
+    if ($sel.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show('请先选中要复制的需求编号（可按住 Ctrl / Shift 多选）。','提示','OK','Information'); return
+    }
+    $texts = @($sel | ForEach-Object { [string]$_.SubItems[1].Text })
+    $text = ($texts -join "`r`n")
+    # 剪贴板可能被其他程序短暂占用，重试 3 次
+    $ok = $false
+    for ($i = 0; $i -lt 3 -and -not $ok; $i++) {
+        try {
+            [System.Windows.Forms.Clipboard]::SetDataObject($text, $true)
+            $ok = $true
+        }
+        catch { Start-Sleep -Milliseconds 120 }
+    }
+    if ($ok) {
+        Add-LogNow ("已复制 {0} 条需求编号到剪贴板。" -f $texts.Count) ([System.Drawing.Color]::Green)
+    }
+    else {
+        Add-LogNow '复制到剪贴板失败（剪贴板可能被其他程序占用），请重试。' ([System.Drawing.Color]::Red)
+    }
+}
+
 function Demand-MergeAll {
     $key = $script:currentProject
     if ([string]::IsNullOrWhiteSpace($key)) { return }
@@ -2298,10 +2498,11 @@ function Build-MainForm {
     $rlPanel = $rightSplit.Panel1
     $rlTable = New-Object System.Windows.Forms.TableLayoutPanel
     $rlTable.Dock = 'Fill'
-    $rlTable.RowCount = 4
+    $rlTable.RowCount = 5
     $rlTable.ColumnCount = 1
     [void]$rlTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 90)))   # 项目信息
     [void]$rlTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))       # 操作按钮
+    [void]$rlTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 40)))   # 检索行（优化版本8 追加：独立一行，位于需求列表标题上方；40px 保证输入框/按钮完整显示）
     [void]$rlTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 22)))   # 列表标题
     [void]$rlTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))   # 需求列表（占据剩余全部空间）
     $rlPanel.Controls.Add($rlTable)
@@ -2320,18 +2521,32 @@ function Build-MainForm {
     $btnDelDemand = New-Object System.Windows.Forms.Button; $btnDelDemand.Text = '删除'; $btnDelDemand.Size = New-Object System.Drawing.Size(75,28); $opBtnPanel.Controls.Add($btnDelDemand)
     $btnToggleStatus = New-Object System.Windows.Forms.Button; $btnToggleStatus.Text = '切换状态'; $btnToggleStatus.Size = New-Object System.Drawing.Size(75,28); $opBtnPanel.Controls.Add($btnToggleStatus)
     $btnView = New-Object System.Windows.Forms.Button; $btnView.Text = '查看'; $btnView.Size = New-Object System.Drawing.Size(75,28); $opBtnPanel.Controls.Add($btnView)
+    # 优化版本8 需求 3：复制按钮（检索控件已移至下方独立检索行）
+    $btnCopyDemand = New-Object System.Windows.Forms.Button; $btnCopyDemand.Text = '复制'; $btnCopyDemand.Size = New-Object System.Drawing.Size(75,28); $opBtnPanel.Controls.Add($btnCopyDemand)
     $btnMergeAll = New-Object System.Windows.Forms.Button; $btnMergeAll.Text = '全部合并'; $btnMergeAll.Size = New-Object System.Drawing.Size(75,28); $btnMergeAll.BackColor = [System.Drawing.Color]::LightGreen; $opBtnPanel.Controls.Add($btnMergeAll)
     $btnMerge = New-Object System.Windows.Forms.Button; $btnMerge.Text = '合并'; $btnMerge.Size = New-Object System.Drawing.Size(75,28); $btnMerge.BackColor = [System.Drawing.Color]::LightGreen; $opBtnPanel.Controls.Add($btnMerge)
 
+    # ---------- 检索行（优化版本8 追加）：独立一行，位于需求列表标题上方，静态过滤需求列表 ----------
+    # 输入即过滤（TextChanged），只显示命中的需求编号；清空输入框恢复全量显示。
+    $searchPanel = New-Object System.Windows.Forms.Panel
+    $searchPanel.Dock = 'Fill'
+    [void]$rlTable.Controls.Add($searchPanel, 0, 2)
+
+    $lblSearch = New-Object System.Windows.Forms.Label; $lblSearch.Text = '检索：'; $lblSearch.Location = New-Object System.Drawing.Point(4,13); $lblSearch.AutoSize = $true; $searchPanel.Controls.Add($lblSearch)
+    $txtSearchDemand = New-Object System.Windows.Forms.TextBox; $txtSearchDemand.Location = New-Object System.Drawing.Point(54,9); $txtSearchDemand.Size = New-Object System.Drawing.Size(240,23); $searchPanel.Controls.Add($txtSearchDemand)
+    $btnSearchDemand = New-Object System.Windows.Forms.Button; $btnSearchDemand.Text = '检索'; $btnSearchDemand.Location = New-Object System.Drawing.Point(300,8); $btnSearchDemand.Size = New-Object System.Drawing.Size(64,25); $searchPanel.Controls.Add($btnSearchDemand)
+    $lblSearchHint = New-Object System.Windows.Forms.Label; $lblSearchHint.Text = '输入编号过滤列表，清空恢复全量显示'; $lblSearchHint.Location = New-Object System.Drawing.Point(372,13); $lblSearchHint.AutoSize = $true; $lblSearchHint.ForeColor = [System.Drawing.Color]::DimGray; $searchPanel.Controls.Add($lblSearchHint)
+
     $lblDemand = New-Object System.Windows.Forms.Label; $lblDemand.Text = '需求编号列表（序号 / 需求编号 / 是否合并）'; $lblDemand.Dock = 'Fill'; $lblDemand.BackColor = [System.Drawing.Color]::LightYellow; $lblDemand.TextAlign = 'MiddleLeft'
-    [void]$rlTable.Controls.Add($lblDemand, 0, 2)
+    [void]$rlTable.Controls.Add($lblDemand, 0, 3)
+
     $demandList = New-Object System.Windows.Forms.ListView
     $demandList.Dock = 'Fill'; $demandList.View = 'Details'; $demandList.FullRowSelect = $true; $demandList.GridLines = $true; $demandList.MultiSelect = $true
     $demandList.BorderStyle = 'FixedSingle'; $demandList.BackColor = [System.Drawing.Color]::White
     $demandList.ForeColor = [System.Drawing.Color]::Black
     $demandList.Font = New-Object System.Drawing.Font('Microsoft YaHei', 10)
     [void]$demandList.Columns.Add('序号', 50); [void]$demandList.Columns.Add('需求编号', 180); [void]$demandList.Columns.Add('是否合并', 80)
-    [void]$rlTable.Controls.Add($demandList, 0, 3)
+    [void]$rlTable.Controls.Add($demandList, 0, 4)
 
     # 右-右栏：脚本执行情况（日志） + 操作面板
     # 同样使用 TableLayoutPanel 避免 Dock=Top+Fill 混用导致的标题错位/内容被遮挡。
@@ -2391,6 +2606,17 @@ function Build-MainForm {
     $btnOverwriteAdd.Add_Click({ Demand-OverwriteAdd })
     $btnAddDemand.Add_Click({ Demand-PlainAdd })
     $btnDelDemand.Add_Click({ Demand-Delete })
+    $btnCopyDemand.Add_Click({ Demand-Copy })
+    $btnSearchDemand.Add_Click({ Demand-Search })
+    # 静态过滤：输入即过滤（只显示命中项），清空即恢复全量显示
+    $txtSearchDemand.Add_TextChanged({ Apply-DemandFilter })
+    $txtSearchDemand.Add_KeyDown({
+        param($s, $e)
+        if ($e.KeyCode -eq [System.Windows.Forms.Keys]::Enter) {
+            $e.SuppressKeyPress = $true
+            Demand-Search
+        }
+    })
     $btnToggleStatus.Add_Click({ Demand-ToggleStatus })
     $btnView.Add_Click({ Demand-View })
     $btnMergeAll.Add_Click({ Demand-MergeAll })
@@ -2405,7 +2631,9 @@ function Build-MainForm {
     })
 
     # 初始禁用需求操作按钮，待选择项目后启用
-    foreach ($b in @($btnOverwriteAdd, $btnAddDemand, $btnDelDemand, $btnToggleStatus, $btnView, $btnMergeAll, $btnMerge)) { $b.Enabled = $false }
+    foreach ($b in @($btnOverwriteAdd, $btnAddDemand, $btnDelDemand, $btnToggleStatus, $btnView,
+                     $btnCopyDemand, $btnSearchDemand, $btnMergeAll, $btnMerge)) { $b.Enabled = $false }
+    $txtSearchDemand.Enabled = $false
 
     # 保存句柄
     $ui.ProjectList      = $projectList
@@ -2418,6 +2646,9 @@ function Build-MainForm {
     $ui.OpLabel          = $opLabel
     $ui.OpFlow           = $opFlow
     $ui.OpConfirm        = $opConfirm
+    $ui.TxtSearchDemand  = $txtSearchDemand
+    $ui.BtnCopyDemand    = $btnCopyDemand
+    $ui.BtnSearchDemand  = $btnSearchDemand
     $ui.BtnOverwriteAdd  = $btnOverwriteAdd
     $ui.BtnAddDemand     = $btnAddDemand
     $ui.BtnDelDemand     = $btnDelDemand
