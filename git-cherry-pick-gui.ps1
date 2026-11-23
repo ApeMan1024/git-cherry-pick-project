@@ -167,7 +167,8 @@ function Test-DemandHasCommitsGui {
 
 function Read-DemandListFile {
     <#
-      读取需求编号文件（gitCommitText.json）。条目结构：{ commitText; isMerge }
+      读取需求编号文件（gitCommitText.json）。条目结构：{ commitText; isMerge; remark }
+      2026-11-20 需求 1 新增 remark（备注）字段：历史文件没有该字段时返回空字符串。
       兼容：文件不存在（返回空列表）、单对象 / 数组两种历史写法、缺少 isMerge 字段。
       isMerge 字段缺失时返回 $null，由调用方决定是否迁移（见 Refresh-DemandList）。
       文件损坏时按 Read-JsonFile 的约定抛错，由调用方决定提示方式。
@@ -184,7 +185,9 @@ function Read-DemandListFile {
             $v = ([string]$e.isMerge).Trim()
             if ($script:FlagLabel.ContainsKey($v)) { $flag = $v }
         }
-        [void]$list.Add([ordered]@{ commitText = $t; isMerge = $flag })
+        $remark = ''
+        if (@($e.PSObject.Properties.Name) -contains 'remark') { $remark = [string]$e.remark }
+        [void]$list.Add([ordered]@{ commitText = $t; isMerge = $flag; remark = $remark })
     }
     # 注意：必须用 ,$list 输出。直接 return $list 会被管道展开——只有一个需求编号时
     # 调用方拿到的是那个 [ordered] 字典本身（.Count 变成字段数 2，遍历变成遍历键名）。
@@ -192,7 +195,8 @@ function Read-DemandListFile {
 }
 
 function Save-DemandListFile {
-    # 写回需求编号文件：每个条目固定写出 commitText + isMerge（isMerge 非法/缺失时按「未合并」= 0 写出）
+    # 写回需求编号文件：每个条目固定写出 commitText + isMerge + remark
+    # （isMerge 非法/缺失时按「未合并」= 0 写出；remark 缺失时写空字符串，2026-11-20 需求 1）
     param(
         [Parameter(Mandatory=$true)][string]$Path,
         [Parameter(Mandatory=$true)]$Entries
@@ -204,6 +208,7 @@ function Save-DemandListFile {
         $o = New-Object PSObject
         $o | Add-Member -MemberType NoteProperty -Name 'commitText' -Value ([string]$e.commitText)
         $o | Add-Member -MemberType NoteProperty -Name 'isMerge'    -Value $flag
+        $o | Add-Member -MemberType NoteProperty -Name 'remark'     -Value ([string]$e.remark)
         [void]$arr.Add($o)
     }
     Write-JsonFile -Path $Path -Object $arr
@@ -273,6 +278,31 @@ function Update-DemandFlagsGui {
     return $changed
 }
 
+function Update-DemandRemarkGui {
+    <#
+      2026-11-20 需求 1：更新单个需求的备注（remark 字段）。
+      需求编号按大小写不敏感匹配（与 Update-DemandFlagsGui 一致）；
+      备注内容按原样写入（前后空格由调用方决定是否去除）。
+      只在确有变化时写盘，返回实际修改的条目数。
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$DemandFile,
+        [Parameter(Mandatory=$true)][string]$DemandNo,
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Remark
+    )
+    $entries = Read-DemandListFile -Path $DemandFile   # 不要再套 @()，见 Refresh-DemandList 注释
+    if ($entries.Count -eq 0) { return 0 }
+    $changed = 0
+    foreach ($e in $entries) {
+        if (-not [string]::Equals([string]$e.commitText, $DemandNo, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        if ([string]::Equals([string]$e.remark, $Remark, [StringComparison]::Ordinal)) { continue }
+        $e.remark = $Remark
+        $changed++
+    }
+    if ($changed -gt 0) { Save-DemandListFile -Path $DemandFile -Entries $entries }
+    return $changed
+}
+
 function Build-PlainAddEntriesGui {
     <#
       优化版本8 需求 1：单纯新增时，本次录入的需求统一排到需求列表最前面；
@@ -280,14 +310,16 @@ function Build-PlainAddEntriesGui {
       未被本次录入涉及的历史条目按原顺序跟在后面。
       纯逻辑函数（无 UI、无文件访问），便于隔离验证。
       参数：
-        Entries  - 现有条目（Read-DemandListFile 的输出，元素为 ordered@{commitText;isMerge}）
+        Entries  - 现有条目（Read-DemandListFile 的输出，元素为 ordered@{commitText;isMerge;remark}）
         InputNos - 本次录入的需求编号（按输入顺序，可含空白行/重复行）
       返回 [PSCustomObject]@{ Entries = 最终条目序列(ArrayList); Added; Skipped }
         Added   = 本次真正新增的条数（isMerge 置为「未合并」）
         Skipped = 输入中命中"已存在"的次数（含输入内部重复，保留原 isMerge 并置顶）
       说明：
-        - 匹配忽略大小写；置顶的已存在条目沿用文件中的原文与原状态，不因输入写法改变。
+        - 匹配忽略大小写；置顶的已存在条目沿用文件中的原文、原状态与原备注，不因输入写法改变。
         - 若文件里同一编号存在多条（历史异常数据），置顶后只保留第一条，其余同编号条目不再重复出现。
+        - 2026-11-20 需求 1：remark（备注）随条目一起携带——已存在条目保留原备注，
+          新增条目备注为空字符串。
     #>
     param(
         [AllowEmptyCollection()]$Entries,
@@ -311,13 +343,13 @@ function Build-PlainAddEntriesGui {
         if (-not $seen.Add($dn)) { $skipped++; continue }   # 输入内部重复
         $u = $dn.ToUpperInvariant()
         if ($origIndex.ContainsKey($u)) {
-            # 已存在：保留原编号原文与原 isMerge，移动到最前
-            [void]$front.Add([ordered]@{ commitText = [string]$origIndex[$u].commitText; isMerge = $origIndex[$u].isMerge })
+            # 已存在：保留原编号原文、原 isMerge 与原备注，移动到最前
+            [void]$front.Add([ordered]@{ commitText = [string]$origIndex[$u].commitText; isMerge = $origIndex[$u].isMerge; remark = [string]$origIndex[$u].remark })
             $skipped++
         }
         else {
-            # 新增的需求统一为「未合并」（优化版本7 需求 2）
-            [void]$front.Add([ordered]@{ commitText = $dn; isMerge = $script:FlagUnmerged })
+            # 新增的需求统一为「未合并」（优化版本7 需求 2），备注为空
+            [void]$front.Add([ordered]@{ commitText = $dn; isMerge = $script:FlagUnmerged; remark = '' })
             $added++
         }
     }
@@ -329,7 +361,7 @@ function Build-PlainAddEntriesGui {
         $u = ([string]$e.commitText).Trim().ToUpperInvariant()
         if ([string]::IsNullOrWhiteSpace($u)) { continue }
         if ($seen.Contains($u)) { continue }   # 本次已置顶的条目不再重复出现在后面
-        [void]$arr.Add([ordered]@{ commitText = [string]$e.commitText; isMerge = $e.isMerge })
+        [void]$arr.Add([ordered]@{ commitText = [string]$e.commitText; isMerge = $e.isMerge; remark = [string]$e.remark })
     }
     return [PSCustomObject]@{ Entries = $arr; Added = $added; Skipped = $skipped }
 }
@@ -843,6 +875,7 @@ function Clear-DemandSearch {
 
 function Apply-DemandFilter {
     # 静态过滤：列表只显示检索命中的需求编号（包含匹配、忽略大小写、支持多关键字）；
+    # 2026-11-20 需求 1：检索同时匹配需求编号与备注列；
     # 检索框为空时恢复全量显示。命中行沿用全量列表中的序号（反映文件中的真实位置）。
     if ($script:suppressDemandFilter) { return }
     $list = $ui.DemandList
@@ -854,16 +887,19 @@ function Apply-DemandFilter {
     }
     $kw = ''
     if ($null -ne $ui.TxtSearchDemand) { $kw = ([string]$ui.TxtSearchDemand.Text).Trim() }
-    $tokens = @($kw -split '[\s,;，；]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+    $tokens = @($kw -split '[\s,;，；、]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 
     $list.BeginUpdate()
     try {
         $list.Items.Clear()
         foreach ($it in $all) {
             if ($tokens.Count -eq 0) { [void]$list.Items.Add($it); continue }
-            $dn = [string]$it.SubItems[1].Text
+            $dn     = [string]$it.SubItems[1].Text
+            $remark = ''
+            if ($it.SubItems.Count -gt 3) { $remark = [string]$it.SubItems[3].Text }   # 备注列（2026-11-20 需求 1）
             foreach ($t in $tokens) {
-                if ($dn.IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                if (($dn.IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -ge 0) -or
+                    ($remark.IndexOf($t, [StringComparison]::OrdinalIgnoreCase) -ge 0)) {
                     [void]$list.Items.Add($it)
                     break
                 }
@@ -891,8 +927,9 @@ function Refresh-DemandList {
     if ($list.View -ne 'Details') { $list.View = 'Details' }
     if ($list.Columns.Count -eq 0) {
         [void]$list.Columns.Add('序号', 50)
-        [void]$list.Columns.Add('需求编号', 180)
+        [void]$list.Columns.Add('需求编号', 170)
         [void]$list.Columns.Add('是否合并', 80)
+        [void]$list.Columns.Add('备注', 120)   # 2026-11-20 需求 1
     }
 
     $paths = Get-ProjectPaths -Key $key
@@ -930,6 +967,7 @@ function Refresh-DemandList {
                 $item = New-Object System.Windows.Forms.ListViewItem ($seq.ToString())
                 [void]$item.SubItems.Add($e.commitText)
                 [void]$item.SubItems.Add($script:FlagLabel[$flag])
+                [void]$item.SubItems.Add([string]$e.remark)   # 2026-11-20 需求 1：备注列
                 $item.Tag = $flag   # 供"合并选中/切换状态"判断，避免比较显示文本
                 [void]$script:demandAllItems.Add($item)
             }
@@ -974,6 +1012,10 @@ function Select-Project {
 
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine("当前项目：$Key")
+    # 2026-11-20 需求 3：项目详情展示项目中文名称（未填写时不显示该行）
+    if (($cfg.PSObject.Properties.Name -contains 'projectCnName') -and (-not [string]::IsNullOrWhiteSpace([string]$cfg.projectCnName))) {
+        [void]$sb.AppendLine("项目中文名称：$([string]$cfg.projectCnName)")
+    }
     [void]$sb.AppendLine("合并前：$($paths.Source)")
     [void]$sb.AppendLine("合并后：$($paths.Target)")
     [void]$sb.AppendLine("需求文件：$($paths.DemandFile)")
@@ -1630,6 +1672,15 @@ function Merge-Conflict {
                 if (-not [string]::IsNullOrWhiteSpace((Get-CherryPickInProgressGui -RepoPath $m.Target))) {
                     Merge-Conflict -PickOutput ''; return
                 }
+                # 2026-11-20 修复：--skip 只跳过当前提交，sequencer 会把本批剩余提交继续应用并真实落提交
+                # （此前成功路径丢弃了 skip 输出，也不写日志，导致"看似只跳过了 1 条"）。
+                # 序列已结束说明剩余批次提交均已应用成功，必须补进 MergedIds —— 否则收尾判定
+                # MergedIds.Count=0 会误报"本次没有合入任何提交"，漏掉 push 询问，本地留下未推送提交。
+                # Mark-BatchAppliedGui 内部会跳过 SkippedIds 成员，不会把刚跳过的提交记成已合并。
+                if (-not [string]::IsNullOrWhiteSpace($skip.Output)) {
+                    Add-Log $skip.Output ([System.Drawing.Color]::Gray)
+                }
+                Mark-BatchAppliedGui -StoppedId ''
                 Merge-ReVerify; return
             }
             'A' {
@@ -1867,6 +1918,12 @@ function Show-ProjectForm {
     $lblName = New-Object System.Windows.Forms.Label; $lblName.Text = '项目名称（必填）'; $lblName.Location = New-Object System.Drawing.Point($x1,$y); $lblName.Size = New-Object System.Drawing.Size($labelW,20); $form.Controls.Add($lblName)
     $txtName = New-Object System.Windows.Forms.TextBox; $txtName.Location = New-Object System.Drawing.Point($x2,$y); $txtName.Size = New-Object System.Drawing.Size($textW,20); $form.Controls.Add($txtName)
 
+    # 2026-11-20 需求 3：项目中文名称（选填），位于项目名称字段下面；
+    # 保存到 warehouse.json 配置的 projectCnName 字段，并在项目详情（右侧信息栏）中展示。
+    $y += 36
+    $lblCnName = New-Object System.Windows.Forms.Label; $lblCnName.Text = '项目中文名称（选填）'; $lblCnName.Location = New-Object System.Drawing.Point($x1,$y); $lblCnName.Size = New-Object System.Drawing.Size($labelW,20); $form.Controls.Add($lblCnName)
+    $txtCnName = New-Object System.Windows.Forms.TextBox; $txtCnName.Location = New-Object System.Drawing.Point($x2,$y); $txtCnName.Size = New-Object System.Drawing.Size($textW,20); $form.Controls.Add($txtCnName)
+
     $y += 36
     $lblBefore = New-Object System.Windows.Forms.Label; $lblBefore.Text = '合并前项目地址（必填）'; $lblBefore.Location = New-Object System.Drawing.Point($x1,$y); $lblBefore.Size = New-Object System.Drawing.Size($labelW,20); $form.Controls.Add($lblBefore)
     $txtBefore = New-Object System.Windows.Forms.TextBox; $txtBefore.Location = New-Object System.Drawing.Point($x2,$y); $txtBefore.Size = New-Object System.Drawing.Size($textW,20); $form.Controls.Add($txtBefore)
@@ -1894,6 +1951,8 @@ function Show-ProjectForm {
         $cfg = $script:warehouse[$EditKey]
         $txtName.Text    = $EditKey
         $txtName.Enabled = $false   # 项目名称不可改（改了就等于换 key）
+        # 2026-11-20 需求 3：预填项目中文名称（历史项目可能没有该字段）
+        if ($cfg.PSObject.Properties.Name -contains 'projectCnName') { $txtCnName.Text = [string]$cfg.projectCnName }
         $txtBefore.Text  = [string]$cfg.beforeAddress
         $txtBack.Text    = [string]$cfg.backAddress
         if ($cfg.PSObject.Properties.Name -contains 'commitRecordAddress') { $txtRec.Text = [string]$cfg.commitRecordAddress }
@@ -1908,6 +1967,7 @@ function Show-ProjectForm {
 
     $btnSave.Add_Click({
         $name = $txtName.Text.Trim()
+        $cnName = $txtCnName.Text.Trim()   # 2026-11-20 需求 3：项目中文名称（选填）
         $before = Format-UserPath $txtBefore.Text
         $back   = Format-UserPath $txtBack.Text
         $rec    = Format-UserPath $txtRec.Text
@@ -1939,6 +1999,11 @@ function Show-ProjectForm {
         $obj | Add-Member -MemberType NoteProperty -Name 'backAddress'           -Value $back
         $obj | Add-Member -MemberType NoteProperty -Name 'commitRecordAddress'   -Value $rec
         $obj | Add-Member -MemberType NoteProperty -Name 'commitTextSearchAddress' -Value $dem
+        # 2026-11-20 需求 3：项目中文名称（选填）——留空时不写出该字段，
+        # 避免给未使用该功能的历史项目批量追加空字段
+        if (-not [string]::IsNullOrWhiteSpace($cnName)) {
+            $obj | Add-Member -MemberType NoteProperty -Name 'projectCnName' -Value $cnName
+        }
 
         if ($EditKey) {
             $script:warehouse[$EditKey] = $obj
@@ -2036,30 +2101,33 @@ function Show-DemandInputDialog {
     param([string]$Title, [string]$DefaultText = '')
     $form = New-Object System.Windows.Forms.Form
     $form.Text = $Title
-    $form.Size = New-Object System.Drawing.Size(420, 320)
+    # 360 高度：按钮区下移留足余量，避免部分 DPI 缩放环境下确定/取消按钮底部被裁（2026-11-23 用户反馈）
+    $form.Size = New-Object System.Drawing.Size(420, 360)
     $form.StartPosition = 'CenterParent'
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false; $form.MinimizeBox = $false
 
     $lbl = New-Object System.Windows.Forms.Label
-    $lbl.Text = '每行代表一个需求编号，可批量录入：'
+    $lbl.Text = '每行一个需求编号，也可用「、」分隔批量录入：'
     $lbl.Location = New-Object System.Drawing.Point(15,15); $lbl.Size = New-Object System.Drawing.Size(380,20)
     $form.Controls.Add($lbl)
 
     $txt = New-Object System.Windows.Forms.TextBox
     $txt.Multiline = $true; $txt.ScrollBars = 'Vertical'
-    $txt.Location = New-Object System.Drawing.Point(15,40); $txt.Size = New-Object System.Drawing.Size(380,200)
+    $txt.Location = New-Object System.Drawing.Point(15,40); $txt.Size = New-Object System.Drawing.Size(380,240)
     $txt.Text = $DefaultText
     $form.Controls.Add($txt)
 
-    $btnOk = New-Object System.Windows.Forms.Button; $btnOk.Text = '确定'; $btnOk.Location = New-Object System.Drawing.Point(215,255); $btnOk.Size = New-Object System.Drawing.Size(90,28); $form.Controls.Add($btnOk)
-    $btnCancel = New-Object System.Windows.Forms.Button; $btnCancel.Text = '取消'; $btnCancel.Location = New-Object System.Drawing.Point(310,255); $btnCancel.Size = New-Object System.Drawing.Size(90,28); $form.Controls.Add($btnCancel)
+    $btnOk = New-Object System.Windows.Forms.Button; $btnOk.Text = '确定'; $btnOk.Location = New-Object System.Drawing.Point(215,290); $btnOk.Size = New-Object System.Drawing.Size(90,28); $form.Controls.Add($btnOk)
+    $btnCancel = New-Object System.Windows.Forms.Button; $btnCancel.Text = '取消'; $btnCancel.Location = New-Object System.Drawing.Point(310,290); $btnCancel.Size = New-Object System.Drawing.Size(90,28); $form.Controls.Add($btnCancel)
 
     $btnCancel.Add_Click({ $form.DialogResult = 'Cancel'; $form.Close() })
     $btnOk.Add_Click({ $form.DialogResult = 'OK'; $form.Close() })
 
     if ($form.ShowDialog() -eq 'OK') {
-        return @($txt.Text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
+        # 2026-11-20 需求 2：除换行符外，同时支持「、」分隔符批量录入；
+        # 两种格式可混用（逐行 + 行内顿号），逐项去首尾空白后过滤空项。
+        return @(($txt.Text -split "`r?`n|、") | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
     }
     return $null
 }
@@ -2076,8 +2144,8 @@ function Demand-OverwriteAdd {
     $arr = New-Object System.Collections.ArrayList
     $dup = 0
     foreach ($d in $input) {
-        # 新增的需求统一为「未合并」（优化版本7 需求 2）
-        if ($seen.Add($d)) { [void]$arr.Add([ordered]@{ commitText = $d; isMerge = $script:FlagUnmerged }) }
+        # 新增的需求统一为「未合并」（优化版本7 需求 2），备注为空（2026-11-20 需求 1）
+        if ($seen.Add($d)) { [void]$arr.Add([ordered]@{ commitText = $d; isMerge = $script:FlagUnmerged; remark = '' }) }
         else { $dup++ }
     }
     Save-DemandListFile -Path $paths.DemandFile -Entries $arr
@@ -2121,10 +2189,10 @@ function Demand-Delete {
 
     $paths = Get-ProjectPaths -Key $key
     $arr = New-Object System.Collections.ArrayList
-    # 保留未被删除的需求编号及其 isMerge 状态
+    # 保留未被删除的需求编号及其 isMerge 状态与备注（2026-11-20 需求 1）
     foreach ($e in (Read-DemandListFile -Path $paths.DemandFile)) {
         if ($toRemove.Contains($e.commitText)) { continue }
-        [void]$arr.Add([ordered]@{ commitText = $e.commitText; isMerge = $e.isMerge })
+        [void]$arr.Add([ordered]@{ commitText = $e.commitText; isMerge = $e.isMerge; remark = [string]$e.remark })
     }
     Save-DemandListFile -Path $paths.DemandFile -Entries $arr
     Add-LogNow ("已删除 {0} 条需求编号。" -f $toRemove.Count) ([System.Drawing.Color]::Green)
@@ -2140,10 +2208,13 @@ function Demand-ToggleStatus {
     $current = $sel[0].SubItems[2].Text
     $currentFlag = ([string]$sel[0].Tag).Trim()
     if (-not $script:FlagLabel.ContainsKey($currentFlag)) { $currentFlag = $script:FlagUnmerged }
+    # 2026-11-20 需求 1：弹窗同时支持调整备注，先从列表行取当前备注用于预填与变化比对
+    $currentRemark = ''
+    if ($sel[0].SubItems.Count -gt 3) { $currentRemark = [string]$sel[0].SubItems[3].Text }
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "切换合并状态 - $dn"
-    $form.Size = New-Object System.Drawing.Size(400, 230)
+    $form.Size = New-Object System.Drawing.Size(420, 310)
     $form.StartPosition = 'CenterParent'; $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false; $form.MinimizeBox = $false
 
@@ -2168,12 +2239,23 @@ function Demand-ToggleStatus {
     $rbNoNeed.Location = New-Object System.Drawing.Point(20,110); $rbNoNeed.Size = New-Object System.Drawing.Size(350,20)
     $form.Controls.Add($rbNoNeed)
 
+    # 2026-11-20 需求 1：备注编辑（选填，可与状态切换同时进行，也可只改备注）
+    $lblRemark = New-Object System.Windows.Forms.Label
+    $lblRemark.Text = '备注（选填，支持按备注检索）：'
+    $lblRemark.Location = New-Object System.Drawing.Point(20,140); $lblRemark.Size = New-Object System.Drawing.Size(350,20)
+    $form.Controls.Add($lblRemark)
+
+    $txtRemark = New-Object System.Windows.Forms.TextBox
+    $txtRemark.Location = New-Object System.Drawing.Point(20,162); $txtRemark.Size = New-Object System.Drawing.Size(360,23)
+    $txtRemark.Text = $currentRemark
+    $form.Controls.Add($txtRemark)
+
     if ($currentFlag -eq $script:FlagMerged)     { $rbMerged.Checked = $true }
     elseif ($currentFlag -eq $script:FlagNoNeed) { $rbNoNeed.Checked = $true }
     else                                        { $rbUnmerged.Checked = $true }
 
-    $btnOk = New-Object System.Windows.Forms.Button; $btnOk.Text = '确定'; $btnOk.Location = New-Object System.Drawing.Point(200,155); $btnOk.Size = New-Object System.Drawing.Size(80,28); $form.Controls.Add($btnOk)
-    $btnCancel = New-Object System.Windows.Forms.Button; $btnCancel.Text = '取消'; $btnCancel.Location = New-Object System.Drawing.Point(290,155); $btnCancel.Size = New-Object System.Drawing.Size(80,28); $form.Controls.Add($btnCancel)
+    $btnOk = New-Object System.Windows.Forms.Button; $btnOk.Text = '确定'; $btnOk.Location = New-Object System.Drawing.Point(210,240); $btnOk.Size = New-Object System.Drawing.Size(80,28); $form.Controls.Add($btnOk)
+    $btnCancel = New-Object System.Windows.Forms.Button; $btnCancel.Text = '取消'; $btnCancel.Location = New-Object System.Drawing.Point(300,240); $btnCancel.Size = New-Object System.Drawing.Size(80,28); $form.Controls.Add($btnCancel)
     $btnCancel.Add_Click({ $form.DialogResult = 'Cancel'; $form.Close() })
     $btnOk.Add_Click({ $form.DialogResult = 'OK'; $form.Close() })
 
@@ -2181,7 +2263,32 @@ function Demand-ToggleStatus {
     $target = $script:FlagUnmerged
     if ($rbMerged.Checked)     { $target = $script:FlagMerged }
     elseif ($rbNoNeed.Checked) { $target = $script:FlagNoNeed }
-    if ($target -eq $currentFlag) { return }
+    $newRemark = ([string]$txtRemark.Text)
+
+    # 2026-11-20 需求 1：状态（isMerge）与备注（remark）两项调整相互独立——
+    # 只改备注不改状态时，不做状态二次确认，也不触发已合清单补记逻辑。
+    $flagChanged   = ($target -ne $currentFlag)
+    $remarkChanged = (-not [string]::Equals($newRemark, $currentRemark, [StringComparison]::Ordinal))
+    if (-not $flagChanged -and -not $remarkChanged) { return }
+
+    # 备注先落盘：即使随后取消状态二次确认，备注的修改也不丢失
+    if ($remarkChanged) {
+        $pathsRemark = Get-ProjectPaths -Key $key
+        try {
+            $changedRemark = Update-DemandRemarkGui -DemandFile $pathsRemark.DemandFile -DemandNo $dn -Remark $newRemark
+            if ($changedRemark -gt 0) {
+                Add-LogNow ("需求 [{0}] 备注已更新。" -f $dn) ([System.Drawing.Color]::Green)
+            }
+            else {
+                Add-LogNow ("需求 [{0}] 的备注未写入（该编号可能不在需求文件中）。" -f $dn) ([System.Drawing.Color]::DarkGoldenrod)
+            }
+        }
+        catch {
+            Add-LogNow "写入备注失败：$($_.Exception.Message)" ([System.Drawing.Color]::Red)
+        }
+    }
+
+    if (-not $flagChanged) { Refresh-DemandList; return }
     $targetText = $script:FlagLabel[$target]
 
     $hint = ''
@@ -2500,17 +2607,27 @@ function Build-MainForm {
     $rlTable.Dock = 'Fill'
     $rlTable.RowCount = 5
     $rlTable.ColumnCount = 1
-    [void]$rlTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 90)))   # 项目信息
+    [void]$rlTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 108)))   # 项目信息（2026-11-20 需求 3 增加"项目中文名称"一行后由 90 调到 108，否则末行"记录目录"被遮盖）
     [void]$rlTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))       # 操作按钮
     [void]$rlTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 40)))   # 检索行（优化版本8 追加：独立一行，位于需求列表标题上方；40px 保证输入框/按钮完整显示）
     [void]$rlTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 22)))   # 列表标题
     [void]$rlTable.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))   # 需求列表（占据剩余全部空间）
     $rlPanel.Controls.Add($rlTable)
 
+    # 项目信息区：AutoScroll Panel 包裹多行 Label —— 内容（含"项目中文名称"行、较长路径折行）
+    # 超过第 0 行固定高度 108px 时自动显示滚动条，不再被截断遮挡（2026-11-20 用户反馈）。
+    $infoScroll = New-Object System.Windows.Forms.Panel
+    $infoScroll.Dock = 'Fill'
+    $infoScroll.AutoScroll = $true
+    $infoScroll.BackColor = [System.Drawing.Color]::FromArgb(245,245,250)
+    [void]$rlTable.Controls.Add($infoScroll, 0, 0)
+
     $projectInfoLabel = New-Object System.Windows.Forms.Label
-    $projectInfoLabel.Text = '未选择项目'; $projectInfoLabel.Dock = 'Fill'
+    $projectInfoLabel.Text = '未选择项目'
+    $projectInfoLabel.AutoSize = $true   # 高度随行数自动增长，供 Panel 计算滚动范围
+    $projectInfoLabel.Dock = 'Top'       # 宽度跟随面板，长路径自动折行
     $projectInfoLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei', 9); $projectInfoLabel.BackColor = [System.Drawing.Color]::FromArgb(245,245,250)
-    [void]$rlTable.Controls.Add($projectInfoLabel, 0, 0)
+    [void]$infoScroll.Controls.Add($projectInfoLabel)
 
     $opBtnPanel = New-Object System.Windows.Forms.FlowLayoutPanel
     $opBtnPanel.Dock = 'Fill'; $opBtnPanel.Height = 80; $opBtnPanel.FlowDirection = 'LeftToRight'; $opBtnPanel.WrapContents = $true; $opBtnPanel.AutoSize = $true
@@ -2535,9 +2652,9 @@ function Build-MainForm {
     $lblSearch = New-Object System.Windows.Forms.Label; $lblSearch.Text = '检索：'; $lblSearch.Location = New-Object System.Drawing.Point(4,13); $lblSearch.AutoSize = $true; $searchPanel.Controls.Add($lblSearch)
     $txtSearchDemand = New-Object System.Windows.Forms.TextBox; $txtSearchDemand.Location = New-Object System.Drawing.Point(54,9); $txtSearchDemand.Size = New-Object System.Drawing.Size(240,23); $searchPanel.Controls.Add($txtSearchDemand)
     $btnSearchDemand = New-Object System.Windows.Forms.Button; $btnSearchDemand.Text = '检索'; $btnSearchDemand.Location = New-Object System.Drawing.Point(300,8); $btnSearchDemand.Size = New-Object System.Drawing.Size(64,25); $searchPanel.Controls.Add($btnSearchDemand)
-    $lblSearchHint = New-Object System.Windows.Forms.Label; $lblSearchHint.Text = '输入编号过滤列表，清空恢复全量显示'; $lblSearchHint.Location = New-Object System.Drawing.Point(372,13); $lblSearchHint.AutoSize = $true; $lblSearchHint.ForeColor = [System.Drawing.Color]::DimGray; $searchPanel.Controls.Add($lblSearchHint)
+    $lblSearchHint = New-Object System.Windows.Forms.Label; $lblSearchHint.Text = '输入编号或备注过滤列表，清空恢复全量显示'; $lblSearchHint.Location = New-Object System.Drawing.Point(372,13); $lblSearchHint.AutoSize = $true; $lblSearchHint.ForeColor = [System.Drawing.Color]::DimGray; $searchPanel.Controls.Add($lblSearchHint)
 
-    $lblDemand = New-Object System.Windows.Forms.Label; $lblDemand.Text = '需求编号列表（序号 / 需求编号 / 是否合并）'; $lblDemand.Dock = 'Fill'; $lblDemand.BackColor = [System.Drawing.Color]::LightYellow; $lblDemand.TextAlign = 'MiddleLeft'
+    $lblDemand = New-Object System.Windows.Forms.Label; $lblDemand.Text = '需求编号列表（序号 / 需求编号 / 是否合并 / 备注）'; $lblDemand.Dock = 'Fill'; $lblDemand.BackColor = [System.Drawing.Color]::LightYellow; $lblDemand.TextAlign = 'MiddleLeft'
     [void]$rlTable.Controls.Add($lblDemand, 0, 3)
 
     $demandList = New-Object System.Windows.Forms.ListView
@@ -2545,7 +2662,7 @@ function Build-MainForm {
     $demandList.BorderStyle = 'FixedSingle'; $demandList.BackColor = [System.Drawing.Color]::White
     $demandList.ForeColor = [System.Drawing.Color]::Black
     $demandList.Font = New-Object System.Drawing.Font('Microsoft YaHei', 10)
-    [void]$demandList.Columns.Add('序号', 50); [void]$demandList.Columns.Add('需求编号', 180); [void]$demandList.Columns.Add('是否合并', 80)
+    [void]$demandList.Columns.Add('序号', 50); [void]$demandList.Columns.Add('需求编号', 170); [void]$demandList.Columns.Add('是否合并', 80); [void]$demandList.Columns.Add('备注', 120)   # 2026-11-20 需求 1：备注列
     [void]$rlTable.Controls.Add($demandList, 0, 4)
 
     # 右-右栏：脚本执行情况（日志） + 操作面板
